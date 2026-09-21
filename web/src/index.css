@@ -237,6 +237,11 @@ html, body, #root {
     backdrop-filter: none !important;
 }
 
+[data-game-view-overlay] * {
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+}
+
 @keyframes phone-peek-in  { from { transform: translateY(118%); } to { transform: translateY(85%); } }
 @keyframes phone-peek-out { from { transform: translateY(85%);  } to { transform: translateY(118%); } }
 

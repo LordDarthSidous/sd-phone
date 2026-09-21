@@ -42,6 +42,15 @@ const PUMP_MS = 16;
 const MIN_FPS = 1;
 const MAX_FPS = 60;
 
+export type GameViewMode = 'off' | 'probe' | 'force';
+
+const GAME_VIEW_PLUGIN_TYPE = 'application/x-cfx-game-view';
+const OVERLAY_HOST_ATTR = 'data-game-view-overlay';
+const PROBE_EVERY_FRAMES = 15;
+const BLACK_PROBES_BEFORE_OVERLAY = 3;
+const PROBE_SAMPLE_COUNT = 64;
+const BLACK_BRIGHTNESS_BELOW = 2;
+
 export class GameRender {
     private readonly renderer: WebGLRenderer;
     private readonly material: ShaderMaterial;
@@ -61,8 +70,16 @@ export class GameRender {
     private zoom = 1;
     private orientation: Orientation = 'portrait';
     private selfie = false;
+    private readonly mode: GameViewMode;
+    private blackProbes = 0;
+    private overlay: HTMLDivElement | null = null;
+    private overlayHost: HTMLElement | null = null;
+    private view: HTMLObjectElement | null = null;
+    private overlayKey = '';
 
-    constructor() {
+    constructor(mode: GameViewMode = 'off') {
+        this.mode = mode;
+
         const gameTexture = new CfxTexture();
         gameTexture.needsUpdate = true;
 
@@ -95,6 +112,9 @@ export class GameRender {
         this.animated = true;
         this.bufW = 0;
         this.bufH = 0;
+        this.blackProbes = 0;
+        this.hideOverlay();
+        if (this.mode === 'force') this.showOverlay();
         this.startPump();
     }
 
@@ -135,6 +155,7 @@ export class GameRender {
         this.animated = false;
         this.canvas = null;
         if (this.pump !== null) { clearInterval(this.pump); this.pump = null; }
+        this.hideOverlay();
         this.rebuild(true);
     }
 
@@ -201,5 +222,88 @@ export class GameRender {
         this.renderer.readRenderTargetPixels(this.rtTexture, 0, 0, w, h, this.pixels);
         this.ctx.putImageData(this.image, 0, 0);
         this.frames += 1;
+
+        if (this.mode === 'probe' && this.frames % PROBE_EVERY_FRAMES === 0) this.probeFeed(w * h);
+        if (this.overlay) this.layoutOverlay();
     };
+
+    private probeFeed(pixelCount: number) {
+        if (!this.pixels) return;
+        if (!this.readbackIsBlack(this.pixels, pixelCount)) {
+            this.blackProbes = 0;
+            this.hideOverlay();
+            return;
+        }
+        this.blackProbes += 1;
+        if (this.blackProbes >= BLACK_PROBES_BEFORE_OVERLAY) this.showOverlay();
+    }
+
+    private readbackIsBlack(pixels: Uint8Array, pixelCount: number): boolean {
+        const stride = Math.max(1, Math.floor(pixelCount / PROBE_SAMPLE_COUNT));
+        let sum = 0;
+        let count = 0;
+        for (let i = 0; i < pixelCount && count < PROBE_SAMPLE_COUNT; i += stride) {
+            const at = i * 4;
+            sum += (pixels[at] + pixels[at + 1] + pixels[at + 2]) / 3;
+            count += 1;
+        }
+        return count > 0 && sum / count < BLACK_BRIGHTNESS_BELOW;
+    }
+
+    private showOverlay() {
+        if (this.overlay || !this.canvas || !this.canvas.isConnected) return;
+        const overlay = document.createElement('div');
+        const view = document.createElement('object');
+        view.type = GAME_VIEW_PLUGIN_TYPE;
+        overlay.appendChild(view);
+        this.canvas.after(overlay);
+        this.overlayHost = this.canvas.parentElement;
+        this.overlayHost?.setAttribute(OVERLAY_HOST_ATTR, '');
+        this.overlay = overlay;
+        this.view = view;
+        this.overlayKey = '';
+        this.layoutOverlay();
+    }
+
+    private hideOverlay() {
+        this.overlay?.remove();
+        this.overlayHost?.removeAttribute(OVERLAY_HOST_ATTR);
+        this.overlayHost = null;
+        this.overlay = null;
+        this.view = null;
+        this.overlayKey = '';
+    }
+
+    private layoutOverlay() {
+        const { canvas, overlay, view } = this;
+        if (!canvas || !overlay || !view) return;
+
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const biasX = this.selfie ? SELFIE_CROP_BIAS_X : 0;
+        const crop = computeCropRegion(w, h, this.zoom, this.orientation, biasX);
+        if (crop.width <= 0 || crop.height <= 0) return;
+
+        const key = [canvas.className, canvas.style.cssText, crop.offsetX, crop.offsetY, crop.width, crop.height].join('|');
+        if (key === this.overlayKey) return;
+        this.overlayKey = key;
+
+        overlay.className = canvas.className;
+        overlay.style.cssText = canvas.style.cssText;
+        overlay.style.filter = 'none';
+        overlay.style.overflow = 'hidden';
+        overlay.style.pointerEvents = 'none';
+
+        view.style.cssText = [
+            'position:absolute',
+            'display:block',
+            'pointer-events:none',
+            'left:0',
+            'top:0',
+            'width:100%',
+            'height:100%',
+            'transform-origin:0 0',
+            `transform:translate(${(-crop.offsetX / crop.width) * 100}%,${(-crop.offsetY / crop.height) * 100}%) scale(${w / crop.width},${h / crop.height})`,
+        ].join(';');
+    }
 }

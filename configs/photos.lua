@@ -23,6 +23,16 @@ return {
     -- file size against visible compression artefacts.
     Quality = 0.85,
 
+    -- FiveM for GTAV Enhanced can hand the phone a black game view, which blacks out the Camera
+    -- viewfinder. This shows the game's own view element over the viewfinder instead. It is a
+    -- live preview only: a photo or clip taken on Enhanced still saves black until Cfx fixes
+    -- game view capture. Legacy servers are never affected by this setting.
+    --   'auto'  = only on an Enhanced server, and only while the view reads back black
+    --   'probe' = the same check on any server, for an Enhanced build 'auto' fails to recognise
+    --   'force' = always show the game's view element, for testing
+    --   false   = never
+    EnhancedGameView = 'auto',
+
     -- Per-player retention cap. Once exceeded, oldest photos are pruned to
     -- keep the row count bounded.
     MaxPhotosPerPlayer = 200,

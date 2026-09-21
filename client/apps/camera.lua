@@ -270,6 +270,12 @@ RegisterNUICallback('sd-phone:camera:open', function(_, cb)
     cb({ success = true, walkable = phonecam.active(), hints = hints.config() })
 end)
 
+---React -> Lua: the game view renderer is being created - reports the mode the server resolved
+---from Photos.EnhancedGameView.
+RegisterNUICallback('sd-phone:render:gameViewMode', function(_, cb)
+    cb({ success = true, mode = GlobalState['sd-phone:gameViewMode'] or 'off' })
+end)
+
 ---React -> Lua: the Camera app unmounted - kill the flash and restore the normal view.
 RegisterNUICallback('sd-phone:camera:close', function(_, cb)
     stopFlash()

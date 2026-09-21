@@ -23,6 +23,20 @@ local util     = require 'server.util'
 ---@type table AirShare core (server.share.core): per-kind delivery handler registry.
 local share    = require 'server.share.core'
 
+---@type string GlobalState key carrying the game view mode every client renders with.
+local GAME_VIEW_MODE_KEY <const> = 'sd-phone:gameViewMode'
+
+---Resolves Photos.EnhancedGameView into the game view mode clients are told to use.
+---@param setting any Photos.EnhancedGameView as written in configs/photos.lua.
+---@return 'off'|'probe'|'force' mode
+local function resolveGameViewMode(setting)
+    if setting == 'probe' or setting == 'force' then return setting end
+    if setting == false or setting == 'off' then return 'off' end
+    return GetConvar('version', ''):find('early-access', 1, true) and 'probe' or 'off'
+end
+
+GlobalState[GAME_VIEW_MODE_KEY] = resolveGameViewMode((config.Photos or require 'configs.photos').EnhancedGameView)
+
 -- The direct-upload switch was renamed when it became opt-in, so a config still carrying the old
 -- key is quietly on the server-relayed path. Say so once, rather than leave an owner wondering why
 -- captures stopped going straight to the CDN.
