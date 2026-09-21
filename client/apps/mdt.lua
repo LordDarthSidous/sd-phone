@@ -23,7 +23,7 @@ local ACTIONS = {
     'warrants:list', 'warrants:get', 'warrants:issue', 'warrants:close', 'warrants:void', 'warrants:update',
     'shares:list', 'shares:create', 'shares:revoke',
     'revisions:list', 'revisions:restore',
-    'live:join', 'live:leave', 'live:lock', 'live:unlock', 'live:draft',
+    'live:join', 'live:leave', 'live:lock', 'live:unlock', 'live:draft', 'live:op', 'live:caret', 'live:sync',
     'offences:list', 'offences:save', 'offences:remove', 'offences:reset',
     'jail:list', 'jail:quote', 'jail:book',
     'roster:list', 'roster:setCallsign', 'roster:setRadio', 'roster:setGrade', 'roster:dismiss', 'roster:page',

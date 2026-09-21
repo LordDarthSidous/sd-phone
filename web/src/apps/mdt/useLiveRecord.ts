@@ -3,7 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNuiEvent } from '@/hooks/useNuiEvent';
 
 import type { LiveHolder, LiveViewer, RecordKind } from './data';
-import { mdtLiveDraft, mdtLiveJoin, mdtLiveLeave, mdtLiveLock, mdtLiveUnlock } from './mdtApi';
+import { LiveTextClient, type RemoteCaret, type TextFlash } from './liveText';
+import { mdtLiveCaret, mdtLiveDraft, mdtLiveJoin, mdtLiveLeave, mdtLiveLock, mdtLiveOp, mdtLiveSync, mdtLiveUnlock } from './mdtApi';
 import { useMdtSession } from './useMdtSession';
 
 const DRAFT_MS = 250;
@@ -11,8 +12,18 @@ const HEARTBEAT_MS = 8000;
 
 export type LiveGone = 'closed' | 'revoked' | null;
 
+export interface LiveTextBinding {
+    value:   string;
+    dirty:   boolean;
+    carets:  RemoteCaret[];
+    flashes: TextFlash[];
+    change:  (next: string) => void;
+    select:  (pos: number | null) => void;
+}
+
 export interface LiveRecord {
     viewers:    LiveViewer[];
+    text:       (field: string) => LiveTextBinding | null;
     drafts:     Record<string, unknown>;
     savedAt:    number;
     savedBy:    string | null;
@@ -44,6 +55,8 @@ export function useLiveRecord(kind: RecordKind, ref: string | null): LiveRecord 
 
     const held = useRef(new Set<string>());
     const pending = useRef(new Map<string, Pending>());
+    const texts = useRef(new Map<string, LiveTextClient>());
+    const [, setTextTick] = useState(0);
 
     useEffect(() => {
         if (!ref) return;
@@ -52,16 +65,27 @@ export function useLiveRecord(kind: RecordKind, ref: string | null): LiveRecord 
         setLocks({});
         setDrafts({});
         setGone(null);
+        const clients = texts.current;
         void mdtLiveJoin(kind, ref).then(state => {
             if (!active || !state) return;
             setViewers(state.viewers ?? []);
             setLocks(state.locks ?? {});
             setDrafts(state.drafts ?? {});
+            for (const [field, seed] of Object.entries(state.texts ?? {})) {
+                clients.set(field, new LiveTextClient({
+                    send:  (rev, op, id) => mdtLiveOp(kind, ref, field, rev, op, id),
+                    sync:  () => mdtLiveSync(kind, ref, field),
+                    caret: pos => mdtLiveCaret(kind, ref, field, pos),
+                }, seed, () => setTextTick(n => n + 1)));
+            }
+            setTextTick(n => n + 1);
         });
         const heldFields = held.current;
         const queue = pending.current;
         return () => {
             active = false;
+            for (const client of clients.values()) client.dispose();
+            clients.clear();
             for (const entry of queue.values()) if (entry.timer !== null) window.clearTimeout(entry.timer);
             queue.clear();
             heldFields.clear();
@@ -81,8 +105,29 @@ export function useLiveRecord(kind: RecordKind, ref: string | null): LiveRecord 
         if (!ref || event.type !== kind || event.ref !== ref) return;
         const field = event.field;
         switch (event.kind) {
-            case 'presence':
+            case 'presence': {
                 setViewers(event.viewers ?? []);
+                const present = new Set((event.viewers ?? []).map(v => v.citizenid));
+                for (const client of texts.current.values()) client.keepOnly(present);
+                break;
+            }
+            case 'op':
+                if (field && event.op && typeof event.rev === 'number') {
+                    texts.current.get(field)?.receiveEdit({
+                        rev: event.rev, op: event.op, id: event.id,
+                        citizenid: event.citizenid ?? '', name: event.name ?? '',
+                    });
+                }
+                break;
+            case 'caret':
+                if (field && event.citizenid && event.citizenid !== selfId) {
+                    texts.current.get(field)?.receiveCaret(event.citizenid, event.name ?? '', event.pos ?? null);
+                }
+                break;
+            case 'text':
+                if (field && typeof event.text === 'string' && typeof event.rev === 'number') {
+                    texts.current.get(field)?.receiveText(event.text, event.rev);
+                }
                 break;
             case 'lock':
                 if (!field) break;
@@ -106,6 +151,7 @@ export function useLiveRecord(kind: RecordKind, ref: string | null): LiveRecord 
             case 'saved': {
                 const fields = event.fields ?? [];
                 for (const name of fields) held.current.delete(name);
+                for (const name of fields) texts.current.get(name)?.markSaved();
                 setLocks(prev => {
                     const next = { ...prev };
                     for (const name of fields) delete next[name];
@@ -185,5 +231,18 @@ export function useLiveRecord(kind: RecordKind, ref: string | null): LiveRecord 
         for (const field of Array.from(held.current)) release(field);
     }, [release]);
 
-    return { viewers, drafts, savedAt, savedBy, gone, heldBy, liveValue, claim, release, releaseAll, send };
+    const text = (field: string): LiveTextBinding | null => {
+        const client = texts.current.get(field);
+        if (!client) return null;
+        return {
+            value:   client.text,
+            dirty:   client.dirty,
+            carets:  client.carets,
+            flashes: client.flashes,
+            change:  next => client.change(next),
+            select:  pos => client.select(pos),
+        };
+    };
+
+    return { viewers, text, drafts, savedAt, savedBy, gone, heldBy, liveValue, claim, release, releaseAll, send };
 }

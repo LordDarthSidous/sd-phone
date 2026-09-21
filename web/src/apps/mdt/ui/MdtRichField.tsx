@@ -1,9 +1,54 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Bold, Code, Heading1, Heading2, Heading3, Italic, List, Strikethrough, Underline } from 'lucide-react';
 
 import { t } from '@/i18n';
+import { colorFor } from '@/lib/format';
+import type { RemoteCaret, TextFlash } from '../liveText';
 import { mdtFieldBase, mdtSectionHeader } from '../mdtTheme';
-import { domToMarkdown, mdToFragment } from './mdtRich';
+import { domToMarkdown, mapDom, mdToFragment, offsetOfPoint, pointOfOffset, shiftOffset, type MdMap } from './mdtRich';
+
+export interface RichCollab {
+    carets:   RemoteCaret[];
+    flashes:  TextFlash[];
+    onSelect: (pos: number | null) => void;
+}
+
+interface CollabMark {
+    key:    string;
+    caret:  boolean;
+    color:  string;
+    name:   string;
+    left:   number;
+    top:    number;
+    width:  number;
+    height: number;
+}
+
+const CARET_FALLBACK_HEIGHT = 20;
+const CARET_TAG_ROOM = 16;
+
+function rangeAt(map: MdMap, from: number, to: number): Range | null {
+    const start = pointOfOffset(map, from);
+    const end = to === from ? start : pointOfOffset(map, to);
+    if (!start || !end) return null;
+    const range = document.createRange();
+    try {
+        range.setStart(start.node, start.offset);
+        range.setEnd(end.node, end.offset);
+    } catch {
+        return null;
+    }
+    return range;
+}
+
+function caretRect(range: Range): DOMRect | null {
+    const rects = range.getClientRects();
+    if (rects.length > 0) return rects[0];
+    const host = range.startContainer.nodeType === Node.ELEMENT_NODE
+        ? range.startContainer as HTMLElement
+        : range.startContainer.parentElement;
+    return host ? host.getBoundingClientRect() : null;
+}
 
 interface Tool {
     id:     string;
@@ -110,15 +155,23 @@ function toggleCode(root: HTMLElement) {
     sel.addRange(after);
 }
 
-export function MdtRichField({ label, value, onChange, rows = 8, maxLength, placeholder }: {
+export function MdtRichField({ label, value, onChange, rows = 8, maxLength, placeholder, collab }: {
     label?:       string;
     value:        string;
     onChange:     (value: string) => void;
     rows?:        number;
     maxLength?:   number;
     placeholder?: string;
+    collab?:      RichCollab;
 }) {
     const ref   = useRef<HTMLDivElement>(null);
+    const frame = useRef<HTMLDivElement>(null);
+    const collabRef = useRef(collab);
+    collabRef.current = collab;
+    const shared = !!collab;
+    const selecting = useRef(false);
+    const [marks, setMarks] = useState<CollabMark[]>([]);
+    const [viewTick, setViewTick] = useState(0);
     const bar   = useRef<HTMLSpanElement>(null);
     const sent  = useRef<string | null>(null);
     const saved = useRef<Range | null>(null);
@@ -126,13 +179,79 @@ export function MdtRichField({ label, value, onChange, rows = 8, maxLength, plac
     const [empty,  setEmpty]  = useState(true);
     const labels = toolLabels();
 
-    useEffect(() => {
+    useLayoutEffect(() => {
         const el = ref.current;
         if (!el || value === sent.current) return;
+
+        let keep: { anchor: number; focus: number } | null = null;
+        const sel = window.getSelection();
+        if (shared && sel && sel.anchorNode && sel.focusNode && el.contains(sel.anchorNode) && el.contains(sel.focusNode)) {
+            const map = mapDom(el);
+            keep = {
+                anchor: shiftOffset(map.md, value, offsetOfPoint(map, sel.anchorNode, sel.anchorOffset)),
+                focus:  shiftOffset(map.md, value, offsetOfPoint(map, sel.focusNode, sel.focusOffset)),
+            };
+        }
+
         sent.current = value;
-        el.replaceChildren(mdToFragment(value));
+        el.replaceChildren(mdToFragment(value, shared));
         setEmpty(value.trim().length === 0);
-    }, [value]);
+
+        if (keep && sel) {
+            const map = mapDom(el);
+            const anchor = pointOfOffset(map, keep.anchor);
+            const focus = pointOfOffset(map, keep.focus);
+            if (anchor && focus) sel.setBaseAndExtent(anchor.node, anchor.offset, focus.node, focus.offset);
+        }
+    }, [value, shared]);
+
+    const carets = collab?.carets;
+    const flashes = collab?.flashes;
+    useLayoutEffect(() => {
+        const el = ref.current;
+        const box = frame.current;
+        if (!el || !box || !carets || !flashes || (carets.length === 0 && flashes.length === 0)) {
+            setMarks(prev => (prev.length === 0 ? prev : []));
+            return;
+        }
+
+        const map = mapDom(el);
+        const outer = box.getBoundingClientRect();
+        const scale = box.offsetWidth > 0 ? outer.width / box.offsetWidth : 1;
+        const next: CollabMark[] = [];
+        const place = (rect: DOMRect, key: string, caret: boolean, color: string, name: string) => {
+            if (rect.bottom <= outer.top || rect.top >= outer.bottom) return;
+            next.push({
+                key, caret, color, name,
+                left:   (rect.left - outer.left) / scale,
+                top:    (rect.top - outer.top) / scale,
+                width:  rect.width / scale,
+                height: (rect.height || CARET_FALLBACK_HEIGHT * scale) / scale,
+            });
+        };
+
+        for (const flash of flashes) {
+            const range = rangeAt(map, flash.from, flash.to);
+            if (!range) continue;
+            Array.from(range.getClientRects()).forEach((rect, i) => {
+                if (rect.width > 0) place(rect, `f${flash.id}:${i}`, false, colorFor(flash.citizenid), '');
+            });
+        }
+        for (const caret of carets) {
+            const range = rangeAt(map, caret.pos, caret.pos);
+            const rect = range && caretRect(range);
+            if (rect) place(rect, `c${caret.citizenid}`, true, colorFor(caret.citizenid), caret.name.split(' ')[0] ?? caret.name);
+        }
+
+        setMarks(prev => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
+    }, [carets, flashes, value, viewTick]);
+
+    useEffect(() => {
+        if (!shared) return;
+        const bump = () => setViewTick(n => n + 1);
+        window.addEventListener('resize', bump);
+        return () => window.removeEventListener('resize', bump);
+    }, [shared]);
 
     useEffect(() => {
         const strip = bar.current;
@@ -153,6 +272,13 @@ export function MdtRichField({ label, value, onChange, rows = 8, maxLength, plac
     const syncMarks = useCallback(() => {
         const el = ref.current;
         const sel = window.getSelection();
+        const live = collabRef.current;
+        if (live && el) {
+            const inside = !!sel?.focusNode && el.contains(sel.focusNode);
+            if (inside && sel?.focusNode) live.onSelect(offsetOfPoint(mapDom(el), sel.focusNode, sel.focusOffset));
+            else if (selecting.current) live.onSelect(null);
+            selecting.current = inside;
+        }
         if (!el || !sel?.anchorNode || !el.contains(sel.anchorNode)) return;
         const block = currentBlock();
         const head = headingAncestor(el)?.tagName.toLowerCase() ?? '';
@@ -172,7 +298,7 @@ export function MdtRichField({ label, value, onChange, rows = 8, maxLength, plac
     function emit() {
         const el = ref.current;
         if (!el) return;
-        const md = domToMarkdown(el);
+        const md = collabRef.current ? mapDom(el).md : domToMarkdown(el);
         setEmpty(el.innerText.trim().length === 0);
         if (md === sent.current) return;
         sent.current = md;
@@ -238,10 +364,11 @@ export function MdtRichField({ label, value, onChange, rows = 8, maxLength, plac
                 </span>
             </div>
 
-            <div className="relative">
+            <div ref={frame} className="relative">
                 <div
                     ref={ref}
                     contentEditable
+                    onScroll={shared ? () => setViewTick(n => n + 1) : undefined}
                     suppressContentEditableWarning
                     role="textbox"
                     aria-multiline="true"
@@ -259,9 +386,33 @@ export function MdtRichField({ label, value, onChange, rows = 8, maxLength, plac
                         e.preventDefault();
                         document.execCommand('insertText', false, e.clipboardData.getData('text/plain'));
                     }}
-                    className={`w-full overflow-y-auto px-3 py-2 text-[15px] leading-snug ${mdtFieldBase} [&_code]:rounded-[4px] [&_code]:bg-black/[0.07] [&_code]:px-1 [&_code]:font-mono [&_code]:text-[0.92em] dark:[&_code]:bg-white/[0.14] [&_ul]:my-1 [&_ul]:list-disc [&_ul]:ps-5 [&_h1]:mb-1 [&_h1]:mt-3 [&_h1]:text-[1.3em] [&_h1]:font-bold [&_h1]:leading-tight [&_h2]:mb-1 [&_h2]:mt-3 [&_h2]:text-[1.15em] [&_h2]:font-bold [&_h2]:leading-tight [&_h3]:mb-0.5 [&_h3]:mt-2.5 [&_h3]:text-[1.02em] [&_h3]:font-semibold [&_h3]:leading-tight [&>*:first-child]:mt-0`}
+                    className={`w-full overflow-y-auto px-3 py-2 text-[15px] leading-snug ${shared ? 'whitespace-pre-wrap' : ''} ${mdtFieldBase} [&_code]:rounded-[4px] [&_code]:bg-black/[0.07] [&_code]:px-1 [&_code]:font-mono [&_code]:text-[0.92em] dark:[&_code]:bg-white/[0.14] [&_ul]:my-1 [&_ul]:list-disc [&_ul]:ps-5 [&_h1]:mb-1 [&_h1]:mt-3 [&_h1]:text-[1.3em] [&_h1]:font-bold [&_h1]:leading-tight [&_h2]:mb-1 [&_h2]:mt-3 [&_h2]:text-[1.15em] [&_h2]:font-bold [&_h2]:leading-tight [&_h3]:mb-0.5 [&_h3]:mt-2.5 [&_h3]:text-[1.02em] [&_h3]:font-semibold [&_h3]:leading-tight [&>*:first-child]:mt-0`}
                     style={{ minHeight: rows * 22, maxHeight: rows * 34 }}
                 />
+                {marks.length > 0 && (
+                    <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-[inherit]" aria-hidden="true">
+                        {marks.map(mark => (mark.caret ? (
+                            <span
+                                key={mark.key}
+                                className="absolute w-[2px] rounded-full"
+                                style={{ left: mark.left - 1, top: mark.top, height: mark.height, background: mark.color }}
+                            >
+                                <span
+                                    className={`absolute start-0 whitespace-nowrap rounded-[5px] px-1 py-px text-[10px] font-semibold leading-tight text-white ${mark.top < CARET_TAG_ROOM ? 'top-full mt-px' : 'bottom-full mb-px'}`}
+                                    style={{ background: mark.color }}
+                                >
+                                    {mark.name}
+                                </span>
+                            </span>
+                        ) : (
+                            <span
+                                key={mark.key}
+                                className="mdt-live-flash absolute rounded-[3px]"
+                                style={{ left: mark.left, top: mark.top, width: mark.width, height: mark.height, background: mark.color }}
+                            />
+                        )))}
+                    </div>
+                )}
                 {empty && placeholder && (
                     <span className="pointer-events-none absolute start-3 top-2 text-[15px] leading-snug text-black/35 dark:text-white/35">
                         {placeholder}

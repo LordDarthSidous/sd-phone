@@ -476,10 +476,17 @@ export interface LiveHolder {
     name:      string;
 }
 
+export interface LiveTextState {
+    text:  string;
+    rev:   number;
+    dirty: boolean;
+}
+
 export interface LiveJoin {
     viewers: LiveViewer[];
     locks:   Record<string, LiveHolder>;
     drafts:  Record<string, unknown>;
+    texts?:  Record<string, LiveTextState>;
     fields:  string[];
     canEdit: boolean;
 }
@@ -488,7 +495,7 @@ export interface LiveEvent {
     key:        string;
     type:       RecordKind;
     ref:        string;
-    kind:       'presence' | 'lock' | 'draft' | 'saved' | 'closed' | 'revoked';
+    kind:       'presence' | 'lock' | 'draft' | 'saved' | 'closed' | 'revoked' | 'op' | 'caret' | 'text';
     viewers?:   LiveViewer[];
     field?:     string;
     holder?:    LiveHolder | null;
@@ -496,6 +503,12 @@ export interface LiveEvent {
     citizenid?: string;
     fields?:    string[];
     by?:        string;
+    rev?:       number;
+    op?:        (number | string)[];
+    id?:        string;
+    name?:      string;
+    pos?:       number | null;
+    text?:      string;
 }
 
 export interface ReportSummary {

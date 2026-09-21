@@ -53,9 +53,9 @@ export function parseInline(text: string): RichSpan[] {
     return text ? [{ text }] : [];
 }
 
-export function parseLines(md: string): RichLine[] {
+export function parseLines(md: string, keepTrailing = false): RichLine[] {
     return md.split('\n').map(raw => {
-        const line = raw.trimEnd();
+        const line = keepTrailing ? raw : raw.trimEnd();
         const heading = /^(#{1,3})\s+(.*)$/.exec(line);
         if (heading) {
             return {
@@ -90,11 +90,11 @@ function emptyLine(): HTMLDivElement {
     return div;
 }
 
-export function mdToFragment(md: string): DocumentFragment {
+export function mdToFragment(md: string, keepTrailing = false): DocumentFragment {
     const frag = document.createDocumentFragment();
     let list: HTMLUListElement | null = null;
 
-    for (const line of parseLines(md)) {
+    for (const line of parseLines(md, keepTrailing)) {
         if (line.bullet) {
             if (!list) {
                 list = document.createElement('ul');
@@ -176,4 +176,145 @@ export function domToMarkdown(root: Node): string {
 
     walk(root, false, 0);
     return out.join('\n').replace(/\s+$/, '');
+}
+
+export interface MdAnchor {
+    node:  Node;
+    start: number;
+    size:  number;
+}
+
+export interface MdMap {
+    md:      string;
+    starts:  Map<Node, number>;
+    ends:    Map<Node, number>;
+    anchors: MdAnchor[];
+}
+
+function isBlockElement(node: Node): node is HTMLElement {
+    return node.nodeType === Node.ELEMENT_NODE && BLOCK.has((node as HTMLElement).tagName);
+}
+
+function closesBlock(br: Node, block: Node): boolean {
+    let node: Node | null = br;
+    while (node && node !== block) {
+        if (node.nextSibling) return false;
+        node = node.parentNode;
+    }
+    return true;
+}
+
+export function mapDom(root: Node): MdMap {
+    const map: MdMap = { md: '', starts: new Map(), ends: new Map(), anchors: [] };
+    let opened = false;
+
+    function openLine(prefix: string) {
+        if (opened) map.md += '\n';
+        opened = true;
+        map.md += prefix;
+    }
+
+    function inline(node: Node, block: Node, prefix: string) {
+        map.starts.set(node, map.md.length);
+        if (node.nodeType === Node.TEXT_NODE) {
+            const text = (node.nodeValue ?? '').replace(NBSP, ' ');
+            map.anchors.push({ node, start: map.md.length, size: text.length });
+            map.md += text;
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+            const el = node as HTMLElement;
+            if (el.tagName === 'BR') {
+                if (!closesBlock(el, block)) openLine(prefix);
+            } else {
+                const mark = MARK_OF_TAG[el.tagName];
+                const wrap = mark && inlineText(el).trim() ? WRAP[mark] : '';
+                map.md += wrap;
+                el.childNodes.forEach(kid => inline(kid, block, prefix));
+                map.md += wrap;
+            }
+        }
+        map.ends.set(node, map.md.length);
+    }
+
+    function line(owner: Node, kids: Node[], block: Node, prefix: string) {
+        openLine(prefix);
+        const before = map.anchors.length;
+        const start = map.md.length;
+        for (const kid of kids) inline(kid, block, prefix);
+        if (map.anchors.length === before) map.anchors.push({ node: owner, start, size: 0 });
+    }
+
+    function walk(node: Node, bullet: boolean, heading: HeadingLevel | 0) {
+        const prefix = bullet ? '- ' : heading ? `${'#'.repeat(heading)} ` : '';
+        const kids = Array.from(node.childNodes);
+        map.starts.set(node, map.md.length);
+
+        if (!kids.some(isBlockElement)) {
+            line(node, kids, node, prefix);
+            map.ends.set(node, map.md.length);
+            return;
+        }
+
+        let run: Node[] = [];
+        const flush = () => {
+            if (run.length > 0 && run.map(inlineNode).join('')) line(node, run, node, prefix);
+            run = [];
+        };
+        for (const kid of kids) {
+            if (isBlockElement(kid)) {
+                flush();
+                walk(kid, kid.tagName === 'LI' ? true : bullet, HEADING_OF_TAG[kid.tagName] ?? 0);
+            } else {
+                run.push(kid);
+            }
+        }
+        flush();
+        map.ends.set(node, map.md.length);
+    }
+
+    walk(root, false, 0);
+    return map;
+}
+
+export function offsetOfPoint(map: MdMap, node: Node, offset: number): number {
+    if (node.nodeType === Node.TEXT_NODE) {
+        const start = map.starts.get(node);
+        return start === undefined ? map.md.length : start + offset;
+    }
+    const at = node.childNodes[offset];
+    if (at) {
+        const start = map.starts.get(at);
+        if (start !== undefined) return start;
+    }
+    const before = offset > 0 ? node.childNodes[offset - 1] : null;
+    if (before) {
+        const end = map.ends.get(before);
+        if (end !== undefined) return end;
+    }
+    return map.ends.get(node) ?? map.starts.get(node) ?? map.md.length;
+}
+
+export function pointOfOffset(map: MdMap, offset: number): { node: Node; offset: number } | null {
+    let best: MdAnchor | null = null;
+    let bestGap = Infinity;
+    for (const anchor of map.anchors) {
+        const gap = offset < anchor.start ? anchor.start - offset : Math.max(0, offset - (anchor.start + anchor.size));
+        if (gap < bestGap) { best = anchor; bestGap = gap; }
+        if (gap === 0 && offset < anchor.start + anchor.size) break;
+    }
+    if (!best) return null;
+    if (best.node.nodeType !== Node.TEXT_NODE) return { node: best.node, offset: 0 };
+    return { node: best.node, offset: Math.min(best.size, Math.max(0, offset - best.start)) };
+}
+
+export function shiftOffset(before: string, after: string, offset: number): number {
+    const max = Math.min(before.length, after.length);
+    let head = 0;
+    while (head < max && before.charCodeAt(head) === after.charCodeAt(head)) head++;
+    if (offset <= head) return offset;
+
+    let tail = 0;
+    while (tail < max - head
+        && before.charCodeAt(before.length - 1 - tail) === after.charCodeAt(after.length - 1 - tail)) tail++;
+    if (offset >= before.length - tail) return offset + (after.length - before.length);
+    return after.length - tail;
 }

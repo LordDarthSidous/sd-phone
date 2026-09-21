@@ -81,6 +81,7 @@ export function CaseFile({ caseRef, onSaved, onDeleted, onClose, onChanged }: {
         { onData: setFile },
     );
     const live = useLiveRecord('case', caseRef);
+    const summaryText = live.text('summary');
     useNuiEvent('sd-phone:mdt:shares', share => { if (share.type === 'case' && share.ref === caseRef) refetch(); });
     const summaryEditing = useRef(false);
     const [sharing, setSharing] = useState(false);
@@ -150,6 +151,10 @@ export function CaseFile({ caseRef, onSaved, onDeleted, onClose, onChanged }: {
     }
 
     function typeSummary(value: string) {
+        if (summaryText) {
+            if (value !== summaryText.value) summaryText.change(value);
+            return;
+        }
         setSummary(value);
         summaryEditing.current = true;
         live.send('summary', value);
@@ -162,6 +167,10 @@ export function CaseFile({ caseRef, onSaved, onDeleted, onClose, onChanged }: {
     }
 
     function discardSummary() {
+        if (summaryText) {
+            if (live.viewers.length <= 1 && file && summaryText.value !== file.summary) summaryText.change(file.summary);
+            return;
+        }
         summaryEditing.current = false;
         live.release('summary');
         setSummary(file?.summary ?? '');
@@ -363,14 +372,15 @@ export function CaseFile({ caseRef, onSaved, onDeleted, onClose, onChanged }: {
                         <>
                             <MdtRichField
                                 rows={5}
-                                value={summary}
+                                value={summaryText ? summaryText.value : summary}
                                 onChange={typeSummary}
                                 maxLength={4000}
                                 placeholder={t('mdt.caseSummaryHint', 'What ties these incidents together.')}
+                                collab={summaryText ? { carets: summaryText.carets, flashes: summaryText.flashes, onSelect: summaryText.select } : undefined}
                             />
-                            {summary !== file.summary && (
+                            {(summaryText ? summaryText.value : summary) !== file.summary && (
                                 <div className="mt-3 flex items-center gap-3">
-                                    <MdtButton size="sm" variant="filled" disabled={saving} onClick={() => void patch({ summary })}>
+                                    <MdtButton size="sm" variant="filled" disabled={saving} onClick={() => void patch({ summary: summaryText ? summaryText.value : summary })}>
                                         {t('common.save', 'Save')}
                                     </MdtButton>
                                     <MdtButton size="sm" variant="text" onClick={discardSummary}>
@@ -379,9 +389,9 @@ export function CaseFile({ caseRef, onSaved, onDeleted, onClose, onChanged }: {
                                 </div>
                             )}
                         </>
-                    ) : live.liveValue('summary', file.summary) ? (
+                    ) : (summaryText ? summaryText.value : live.liveValue('summary', file.summary)) ? (
                         <MdtRichText
-                            text={live.liveValue('summary', file.summary)}
+                            text={summaryText ? summaryText.value : live.liveValue('summary', file.summary)}
                             className="text-[15px] leading-relaxed text-black dark:text-white"
                         />
                     ) : (

@@ -126,6 +126,36 @@ local function lockRefusal(kind, ref, fields, src)
     return nil
 end
 
+---@type integer Longest editor name a revision keeps, matching phone_mdt_revisions.editor_name.
+local EDITOR_NAME_MAX <const> = 96
+
+---The identity a shared text's revision is filed under: the saver, naming whoever else typed into it.
+---@param me table editor identity
+---@param kind string
+---@param ref string
+---@param field string
+---@return table editor
+local function withContributors(me, kind, ref, field)
+    local others = live.contributors(kind, ref, field, me.citizenid)
+    if #others == 0 then return me end
+    local editor = {}
+    for key, value in pairs(me) do editor[key] = value end
+    editor.name = (('%s (with %s)'):format(me.name, table.concat(others, ', '))):sub(1, EDITOR_NAME_MAX)
+    return editor
+end
+
+---The shared text a save should file for a field, when terminals have it open and it was asked for.
+---@param kind string
+---@param ref string
+---@param field string
+---@param fields table<string, boolean>
+---@param payload table
+---@return string|nil text, integer|nil rev
+local function sharedText(kind, ref, field, fields, payload)
+    if payload.restoring or not fields[field] then return nil, nil end
+    return live.textOf(kind, ref, field)
+end
+
 ---Writes a revision per change and tells everyone on the record what was saved.
 ---@param me table editor identity
 ---@param kind string
@@ -133,13 +163,16 @@ end
 ---@param src integer
 ---@param fields table<string, boolean> every field the save covered
 ---@param changed { field: string, before: string, after: string }[]
-local function settle(me, kind, ref, src, fields, changed)
+---@param texts table<string, { text: string, rev: integer|nil }>|nil what each shared text field now holds
+local function settle(me, kind, ref, src, fields, changed, texts)
     for i = 1, #changed do
-        revisions.record(me, kind, ref, changed[i].field, changed[i].before, changed[i].after)
+        local field = changed[i].field
+        local editor = texts and texts[field] and withContributors(me, kind, ref, field) or me
+        revisions.record(editor, kind, ref, field, changed[i].before, changed[i].after)
     end
     local names = {}
     for field in pairs(fields) do names[#names + 1] = field end
-    live.saved(kind, ref, src, names, me.name)
+    live.saved(kind, ref, src, names, me.name, texts)
 end
 
 ---Tags each row of a court list with the access its department holds.
@@ -297,12 +330,12 @@ local function reportAccess(src, me, ref)
     if access.isCourt(me) then
         local level = shares.accessFor(me, 'report', ref)
         local edit = level == 'edit' and access.can(src, 'shared.edit')
-        return { row = row, view = true, edit = edit, owner = false, restore = false, fields = edit and REPORT_FIELDS or {}, access = level }
+        return { row = row, view = true, edit = edit, owner = false, restore = false, fields = edit and REPORT_FIELDS or {}, access = level, texts = { body = row.body or '' } }
     end
     local edit = access.can(src, 'reports.edit.any')
         or (row.author_cid == me.citizenid and access.can(src, 'reports.edit.own'))
     local owner = row.domain == 'leo' and access.domain(me) == 'leo'
-    return { row = row, view = true, edit = edit, owner = owner, restore = edit, fields = edit and REPORT_FIELDS or {} }
+    return { row = row, view = true, edit = edit, owner = owner, restore = edit, fields = edit and REPORT_FIELDS or {}, texts = { body = row.body or '' } }
 end
 
 ---Encodes people and charge lines in a fixed key order, so equal parties always encode equal.
@@ -596,12 +629,15 @@ local function updateReport(src, payload, me)
     if not ref or not res or not res.edit then return util.fail('mdt.reportNotAvailable', 'That report is not available') end
     local row = res.row
 
-    local draft, refusal = sanitizeReport(payload, me)
-    if not draft then return refusal end
-
     local fields = requestedFields(payload.fields, res.fields)
     local locked = lockRefusal('report', ref, fields, src)
     if locked then return locked end
+
+    local sharedBody, sharedRev = sharedText('report', ref, 'body', fields, payload)
+    if sharedBody then payload.body = sharedBody end
+
+    local draft, refusal = sanitizeReport(payload, me)
+    if not draft then return refusal end
 
     local after = {
         title    = draft.title,
@@ -642,7 +678,7 @@ local function updateReport(src, payload, me)
         MySQL.transaction.await(queries)
     end
 
-    settle(me, 'report', ref, src, fields, changed)
+    settle(me, 'report', ref, src, fields, changed, fields.body and { body = { text = draft.body, rev = sharedRev } } or nil)
 
     local saved = MySQL.single.await('SELECT * FROM phone_mdt_reports WHERE id = ?', { row.id })
     if not saved then return util.fail('mdt.reportCouldNotSaved', 'The report could not be saved') end
@@ -664,8 +700,9 @@ local function restoreReport(src, me, ref, field, value)
 
     local current = detailOf(me, src, res.row)
     local payload = {
-        ref      = ref,
-        fields   = { field },
+        ref       = ref,
+        restoring = true,
+        fields    = { field },
         title    = current.title,
         type     = current.type,
         body     = current.body,
@@ -976,10 +1013,10 @@ local function caseAccess(src, me, ref)
     if access.isCourt(me) then
         local level = shares.accessFor(me, 'case', ref)
         local edit = level == 'edit' and access.can(src, 'shared.edit')
-        return { row = row, view = true, edit = edit, owner = false, restore = false, fields = edit and CASE_COURT_FIELDS or {}, access = level }
+        return { row = row, view = true, edit = edit, owner = false, restore = false, fields = edit and CASE_COURT_FIELDS or {}, access = level, texts = { summary = row.summary or '' } }
     end
     local edit = access.can(src, 'cases.edit')
-    return { row = row, view = true, edit = edit, owner = access.domain(me) == 'leo', restore = edit, fields = edit and CASE_FIELDS or {} }
+    return { row = row, view = true, edit = edit, owner = access.domain(me) == 'leo', restore = edit, fields = edit and CASE_FIELDS or {}, texts = { summary = row.summary or '' } }
 end
 
 ---Composes the case the detail pane renders, with what the caller may do to it.
@@ -1120,6 +1157,9 @@ local function updateCase(src, payload, me)
     local locked = lockRefusal('case', ref, fields, src)
     if locked then return locked end
 
+    local sharedSummary, sharedRev = sharedText('case', ref, 'summary', fields, payload)
+    if sharedSummary then payload.summary = sharedSummary end
+
     local title = util.limitedString(payload.title, tonumber(LIMITS.CaseTitle) or 160)
     if fields.title and not title then return util.fail('mdt.titleRequired', 'A title is required') end
 
@@ -1155,7 +1195,7 @@ local function updateCase(src, payload, me)
         MySQL.update.await(('UPDATE phone_mdt_cases SET %s WHERE id = ?'):format(table.concat(sets, ', ')), values)
     end
 
-    settle(me, 'case', ref, src, fields, changed)
+    settle(me, 'case', ref, src, fields, changed, fields.summary and { summary = { text = after.summary, rev = sharedRev } } or nil)
 
     return util.ok({ case = caseDetail(src, caseRow(me, ref), me) }),
         { entityType = 'case', entityId = ref, details = { title = after.title, status = after.status, priority = after.priority } }
@@ -1174,8 +1214,9 @@ local function restoreCase(src, me, ref, field, value)
 
     local row = res.row
     local payload = {
-        ref      = ref,
-        fields   = { field },
+        ref       = ref,
+        restoring = true,
+        fields    = { field },
         title    = row.title,
         summary  = row.summary or '',
         evidence = readEvidence(row.evidence),

@@ -72,6 +72,7 @@ import {
     type EvidenceItem,
     type Protocol,
     type LiveJoin,
+    type LiveTextState,
     type RecordKind,
     type Revision,
     type ShareAccess,
@@ -2046,6 +2047,22 @@ export function mdtLiveUnlock(kind: RecordKind, ref: string, field: string): voi
 export function mdtLiveDraft(kind: RecordKind, ref: string, field: string, value: unknown): void {
     if (!isFiveM) return;
     void apiCall('sd-phone:mdt:live:draft', { type: kind, ref, field, value });
+}
+
+export async function mdtLiveOp(kind: RecordKind, ref: string, field: string, rev: number, op: (number | string)[], id: string): Promise<boolean> {
+    if (!isFiveM) return true;
+    const res = await apiCall<unknown>('sd-phone:mdt:live:op', { type: kind, ref, field, rev, op, id });
+    return res.success;
+}
+
+export function mdtLiveCaret(kind: RecordKind, ref: string, field: string, pos: number | null): void {
+    if (!isFiveM) return;
+    void apiCall('sd-phone:mdt:live:caret', { type: kind, ref, field, pos });
+}
+
+export async function mdtLiveSync(kind: RecordKind, ref: string, field: string): Promise<LiveTextState | null> {
+    if (!isFiveM) return null;
+    return apiData<LiveTextState>('sd-phone:mdt:live:sync', { type: kind, ref, field });
 }
 
 const DEV_SOPS: Sop[] = [

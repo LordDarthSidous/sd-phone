@@ -2,12 +2,14 @@
 local util   = require 'server.util'
 ---@type table MDT permissions (server.mdt.access): identity and the terminal gate.
 local access = require 'server.mdt.access'
+---@type table Text operations (server.mdt.textop): checks, rebases and applies live text edits.
+local textop = require 'server.mdt.textop'
 
 ---@type table Live module; the table returned at end of file. Presence, field locks and in-flight
 ---drafts for the paperwork a terminal has open.
 local live = {}
 
----@alias LiveAccess { row: table, view: boolean, edit: boolean, owner: boolean, restore: boolean, fields: table<string, boolean>, access: string|nil }
+---@alias LiveAccess { row: table, view: boolean, edit: boolean, owner: boolean, restore: boolean, fields: table<string, boolean>, access: string|nil, texts: table<string, string>|nil }
 
 ---@alias LiveResolver fun(src: integer, me: table, ref: string): LiveAccess|nil
 
@@ -30,9 +32,28 @@ local MAX_DRAFT_BYTES <const> = 48000
 ---@type integer How often expired locks are swept, in ms.
 local SWEEP_MS <const> = 5000
 
+---@type integer Largest shared text, in bytes.
+local MAX_TEXT_BYTES <const> = 48000
+
+---@type integer Largest single insert an edit may carry, in bytes.
+local MAX_INSERT_BYTES <const> = 16000
+
+---@type integer Edits kept per text so a terminal that is behind can be rebased.
+local HISTORY_KEPT <const> = 300
+
+---@type integer Edits one source may send per second.
+local OPS_PER_SECOND <const> = 40
+
+---@type integer Milliseconds between two caret positions from one source.
+local CARET_GAP_MS <const> = 80
+
+---@type integer Seconds an empty room keeps unsaved shared text before dropping it.
+local UNSAVED_TTL <const> = 1800
+
 ---@alias LiveMember { cid: string, name: string, department: string }
 ---@alias LiveLock { src: integer, cid: string, name: string, at: integer }
----@alias LiveRoom { kind: string, ref: string, members: table<integer, LiveMember>, locks: table<string, LiveLock>, drafts: table<string, any> }
+---@alias LiveText { text: string, saved: string, units: integer, rev: integer, savedRev: integer, history: table<integer, TextOp>, authors: table<string, string> }
+---@alias LiveRoom { kind: string, ref: string, members: table<integer, LiveMember>, locks: table<string, LiveLock>, drafts: table<string, any>, texts: table<string, LiveText>, emptiedAt: integer|nil }
 
 ---@type table<string, LiveRoom> Open records by `kind:ref`.
 local rooms = {}
@@ -42,6 +63,12 @@ local seats = {}
 
 ---@type table<integer, integer> GetGameTimer() of each source's last relayed draft.
 local lastDraft = {}
+
+---@type table<integer, integer> GetGameTimer() of each source's last relayed caret.
+local lastCaret = {}
+
+---@type table<integer, { second: integer, count: integer }> Edits each source sent in the current second.
+local opRate = {}
 
 ---Registers how a record kind is read and restored.
 ---@param kind string
@@ -114,7 +141,21 @@ local function stateOf(room)
             if room.drafts[field] ~= nil then drafts[field] = room.drafts[field] end
         end
     end
-    return { viewers = viewers, locks = locks, drafts = drafts }
+    local texts = {}
+    for field, doc in pairs(room.texts) do
+        texts[field] = { text = doc.text, rev = doc.rev, dirty = doc.rev ~= doc.savedRev }
+    end
+    return { viewers = viewers, locks = locks, drafts = drafts, texts = texts }
+end
+
+---Whether a room holds shared text nobody has saved yet.
+---@param room LiveRoom
+---@return boolean
+local function unsaved(room)
+    for _, doc in pairs(room.texts) do
+        if doc.rev ~= doc.savedRev then return true end
+    end
+    return false
 end
 
 ---Pushes one change to everyone in a room, optionally skipping the source that caused it.
@@ -159,7 +200,7 @@ local function vacate(key, src)
     room.members[src] = nil
     local released = releaseAll(room, src)
     if next(room.members) == nil then
-        rooms[key] = nil
+        if unsaved(room) then room.emptiedAt = os.time() else rooms[key] = nil end
         return
     end
     for i = 1, #released do broadcast(room, { kind = 'lock', field = released[i], holder = nil }) end
@@ -191,8 +232,15 @@ live.join = access.open(function(src, payload, me)
     local key = keyOf(kind, ref)
     local room = rooms[key]
     if not room then
-        room = { kind = kind, ref = ref, members = {}, locks = {}, drafts = {} }
+        room = { kind = kind, ref = ref, members = {}, locks = {}, drafts = {}, texts = {} }
         rooms[key] = room
+    end
+    room.emptiedAt = nil
+    for field, value in pairs(res.texts or {}) do
+        if not room.texts[field] then
+            local text = type(value) == 'string' and value or ''
+            room.texts[field] = { text = text, saved = text, units = textop.units(text), rev = 0, savedRev = 0, history = {}, authors = {} }
+        end
     end
     room.members[src] = {
         cid        = me.citizenid,
@@ -229,6 +277,8 @@ live.lock = access.open(function(src, payload, me)
     if not field or not res or not res.edit or not (res.fields or {})[field] then
         return util.fail('mdt.rankDoesNotAllow', 'Your rank does not allow that')
     end
+
+    if room.texts[field] then return util.ok({ field = field, shared = true }) end
 
     local lock = room.locks[field]
     if current(lock) and lock.src ~= src then
@@ -280,6 +330,119 @@ live.draft = access.open(function(src, payload)
     return util.ok({})
 end)
 
+---Whether a source may send another edit this second.
+---@param src integer
+---@return boolean
+local function underOpRate(src)
+    local second = os.time()
+    local rate = opRate[src]
+    if not rate or rate.second ~= second then
+        opRate[src] = { second = second, count = 1 }
+        return true
+    end
+    rate.count = rate.count + 1
+    return rate.count <= OPS_PER_SECOND
+end
+
+---Takes one edit to a shared text, rebases it over whatever landed since the sender's revision,
+---applies it and sends the result to everyone on the record, the sender included.
+live.op = access.open(function(src, payload, me)
+    local room = joined(src, payload)
+    local field = util.limitedString(payload.field, 24)
+    local doc = room and field and room.texts[field]
+    if not room or not field or not doc then return util.fail('mdt.recordNotAvailable', 'That record is not available') end
+
+    local res = live.resolve(room.kind, src, me, room.ref)
+    if not res or not res.edit or not (res.fields or {})[field] then
+        return util.fail('mdt.rankDoesNotAllow', 'Your rank does not allow that')
+    end
+    if not underOpRate(src) then return util.fail('mdt.liveResync', 'Resync') end
+
+    local rev = math.tointeger(tonumber(payload.rev))
+    local op = textop.check(payload.op, MAX_INSERT_BYTES)
+    if not rev or not op or rev > doc.rev or doc.rev - rev > HISTORY_KEPT then
+        return util.fail('mdt.liveResync', 'Resync')
+    end
+
+    for r = rev + 1, doc.rev do
+        op = doc.history[r] and textop.transform(op, doc.history[r])
+        if not op then return util.fail('mdt.liveResync', 'Resync') end
+    end
+
+    local text = textop.apply(doc.text, op)
+    if not text or #text > MAX_TEXT_BYTES then return util.fail('mdt.liveResync', 'Resync') end
+
+    doc.text = text
+    doc.units = textop.units(text)
+    doc.rev = doc.rev + 1
+    doc.history[doc.rev] = op
+    doc.history[doc.rev - HISTORY_KEPT] = nil
+    doc.authors[me.citizenid] = me.name
+    if doc.text == doc.saved then
+        doc.savedRev = doc.rev
+        doc.authors = {}
+    end
+
+    broadcast(room, {
+        kind = 'op', field = field, rev = doc.rev, op = op,
+        citizenid = me.citizenid, name = me.name, id = util.limitedString(payload.id, 24),
+    })
+    return util.ok({ rev = doc.rev })
+end)
+
+---Relays where a caller's caret sits in a shared text, or that it left.
+live.caret = access.open(function(src, payload, me)
+    local room = joined(src, payload)
+    local field = util.limitedString(payload.field, 24)
+    if not room or not field or not room.texts[field] then return util.ok({}) end
+
+    local nowMs = GetGameTimer()
+    local pos = math.tointeger(tonumber(payload.pos))
+    if pos and lastCaret[src] and nowMs - lastCaret[src] < CARET_GAP_MS then return util.ok({ throttled = true }) end
+    lastCaret[src] = nowMs
+
+    broadcast(room, { kind = 'caret', field = field, pos = pos, citizenid = me.citizenid, name = me.name }, src)
+    return util.ok({})
+end)
+
+---Answers with a shared text as the server holds it, for a terminal that fell out of step.
+live.sync = access.open(function(src, payload)
+    local room = joined(src, payload)
+    local field = util.limitedString(payload.field, 24)
+    local doc = room and field and room.texts[field]
+    if not doc then return util.fail('mdt.recordNotAvailable', 'That record is not available') end
+    return util.ok({ text = doc.text, rev = doc.rev, dirty = doc.rev ~= doc.savedRev })
+end)
+
+---The shared text of a field and the revision it stands at, or nil when nobody has it open.
+---@param kind string
+---@param ref string
+---@param field string
+---@return string|nil text, integer|nil rev
+function live.textOf(kind, ref, field)
+    local room = rooms[keyOf(kind, ref)]
+    local doc = room and room.texts[field]
+    if not doc then return nil, nil end
+    return doc.text, doc.rev
+end
+
+---The names of everyone but `exceptCid` who typed into a shared text since it was last saved.
+---@param kind string
+---@param ref string
+---@param field string
+---@param exceptCid string
+---@return string[] names
+function live.contributors(kind, ref, field, exceptCid)
+    local room = rooms[keyOf(kind, ref)]
+    local doc = room and room.texts[field]
+    local names = {}
+    for cid, name in pairs(doc and doc.authors or {}) do
+        if cid ~= exceptCid then names[#names + 1] = name end
+    end
+    table.sort(names)
+    return names
+end
+
 ---The name of whoever else holds a field's lock, or nil when it is free or held by `src`.
 ---@param kind string
 ---@param ref string
@@ -293,18 +456,46 @@ function live.lockedByOther(kind, ref, field, src)
     return nil
 end
 
+---Settles a shared text against what was just written: clean when it still stands at the
+---revision that was saved, replaced for everyone when the record now holds something else.
+---@param room LiveRoom
+---@param field string
+---@param stored { text: string, rev: integer|nil }
+local function settleText(room, field, stored)
+    local doc = room.texts[field]
+    if not doc then return end
+    if stored.rev and doc.rev ~= stored.rev then
+        doc.savedRev = stored.rev
+        return
+    end
+    doc.authors = {}
+    doc.saved = stored.text
+    if doc.text == stored.text then
+        doc.savedRev = doc.rev
+        return
+    end
+    doc.text = stored.text
+    doc.units = textop.units(stored.text)
+    doc.rev = doc.rev + 1
+    doc.savedRev = doc.rev
+    doc.history = {}
+    broadcast(room, { kind = 'text', field = field, text = doc.text, rev = doc.rev })
+end
+
 ---Announces that fields were saved, releasing the saver's locks on them.
 ---@param kind string
 ---@param ref string
 ---@param src integer
 ---@param fields string[]
 ---@param by string display name of the saver
-function live.saved(kind, ref, src, fields, by)
+---@param texts table<string, { text: string, rev: integer|nil }>|nil what each shared text field now holds
+function live.saved(kind, ref, src, fields, by, texts)
     local room = rooms[keyOf(kind, ref)]
     if not room then return end
     local only = {}
     for i = 1, #fields do only[fields[i]] = true end
     releaseAll(room, src, only)
+    for field, stored in pairs(texts or {}) do settleText(room, field, stored) end
     broadcast(room, { kind = 'saved', fields = fields, by = by })
 end
 
@@ -345,12 +536,18 @@ util.onCleanup(function(src)
     for key in pairs(seats[src] or {}) do vacate(key, src) end
     seats[src] = nil
     lastDraft[src] = nil
+    lastCaret[src] = nil
+    opRate[src] = nil
 end)
 
 ---Releases locks whose holders stopped touching them, so a closed tab never pins a field.
 CreateThread(function()
     while true do
         Wait(SWEEP_MS)
+        local now = os.time()
+        for key, room in pairs(rooms) do
+            if room.emptiedAt and now - room.emptiedAt > UNSAVED_TTL then rooms[key] = nil end
+        end
         for _, room in pairs(rooms) do
             for field, lock in pairs(room.locks) do
                 if not current(lock) then

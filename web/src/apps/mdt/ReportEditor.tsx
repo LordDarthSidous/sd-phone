@@ -37,7 +37,7 @@ import { MdtButton } from './ui/MdtButton';
 import { MdtCard } from './ui/MdtCard';
 import { MdtField } from './ui/MdtField';
 import { MdtEvidence } from './ui/MdtEvidence';
-import { MdtRichField } from './ui/MdtRichField';
+import { MdtRichField, type RichCollab } from './ui/MdtRichField';
 import { MdtRichText } from './ui/MdtRichText';
 
 export const REPORT_TYPES: readonly ReportType[] = ['Incident', 'Traffic', 'Arrest', 'Investigation', 'Warrant'] as const;
@@ -172,6 +172,7 @@ export function ReportEditor({ reportRef, onSaved, onDeleted, onClose }: {
     const [history, setHistory] = useState(false);
 
     const live = useLiveRecord('report', reportRef);
+    const bodyText = reportRef ? live.text('body') : null;
     useNuiEvent('sd-phone:mdt:shares', share => { if (share.type === 'report' && share.ref === reportRef) refetch(); });
     const touched = useRef(new Set<ReportField>());
 
@@ -210,6 +211,10 @@ export function ReportEditor({ reportRef, onSaved, onDeleted, onClose }: {
         setStored(next);
         if (!prev || !next.ref) return;
         for (const field of REPORT_FIELDS) {
+            if (field === 'body' && bodyText) {
+                if (next.body !== bodyText.value) bodyText.change(next.body);
+                continue;
+            }
             if (sameField(prev, next, field)) continue;
             touched.current.add(field);
             live.send(field, fieldOf(next, field));
@@ -232,7 +237,13 @@ export function ReportEditor({ reportRef, onSaved, onDeleted, onClose }: {
         setError('');
     }
 
+    function discardSharedBody() {
+        if (!bodyText || !report || live.viewers.length > 1) return;
+        if (bodyText.value !== report.body) bodyText.change(report.body);
+    }
+
     function cancel() {
+        discardSharedBody();
         stopEditing();
         if (reportRef === null) onClose();
     }
@@ -244,7 +255,9 @@ export function ReportEditor({ reportRef, onSaved, onDeleted, onClose }: {
             return;
         }
         const base = report ? draftFrom(report) : null;
-        const fields = draft.ref && base ? REPORT_FIELDS.filter(field => !sameField(draft, base, field)) : undefined;
+        const fields = draft.ref && base
+            ? REPORT_FIELDS.filter(field => (field === 'body' && bodyText ? bodyText.value !== base.body : !sameField(draft, base, field)))
+            : undefined;
         if (fields && fields.length === 0) {
             stopEditing();
             return;
@@ -254,7 +267,7 @@ export function ReportEditor({ reportRef, onSaved, onDeleted, onClose }: {
             ref:      draft.ref,
             title:    draft.title.trim(),
             type:     draft.type,
-            body:     draft.body,
+            body:     bodyText ? bodyText.value : draft.body,
             evidence: draft.evidence,
             involved: draft.involved.map(person => ({
                 citizenid: person.citizenid,
@@ -298,10 +311,11 @@ export function ReportEditor({ reportRef, onSaved, onDeleted, onClose }: {
     }
 
     if (draft && !staleDraft) {
-        const shown = REPORT_FIELDS.reduce(
+        const merged = REPORT_FIELDS.reduce(
             (acc, field) => (live.heldBy(field) ? withField(acc, field, live.liveValue(field, fieldOf(acc, field))) : acc),
             draft,
         );
+        const shown = bodyText ? { ...merged, body: bodyText.value } : merged;
         return (
             <>
                 <DraftView
@@ -310,6 +324,8 @@ export function ReportEditor({ reportRef, onSaved, onDeleted, onClose }: {
                     error={error}
                     enter={enter}
                     lockedBy={live.heldBy}
+                    bodyCollab={bodyText ? { carets: bodyText.carets, flashes: bodyText.flashes, onSelect: bodyText.select } : undefined}
+                    bodyUnsaved={!!bodyText && !!report && bodyText.value !== report.body}
                     presence={<LivePresence live={live} />}
                     onChange={edit}
                     onAddPerson={() => setPicking(true)}
@@ -360,7 +376,7 @@ export function ReportEditor({ reportRef, onSaved, onDeleted, onClose }: {
 
     const totals = chargeTotals(report.charges);
     const liveTitle = live.liveValue('title', report.title);
-    const liveBody = live.liveValue('body', report.body);
+    const liveBody = bodyText ? bodyText.value : live.liveValue('body', report.body);
 
     const bookable = can('jail.book')
         && report.charges.length > 0
@@ -590,12 +606,14 @@ export function ReportEditor({ reportRef, onSaved, onDeleted, onClose }: {
     );
 }
 
-function DraftView({ draft, saving, error, enter, lockedBy, presence, onChange, onAddPerson, onSave, onCancel }: {
+function DraftView({ draft, saving, error, enter, lockedBy, bodyCollab, bodyUnsaved, presence, onChange, onAddPerson, onSave, onCancel }: {
     draft:       EditDraft;
     saving:      boolean;
     error:       string;
     enter:       string;
     lockedBy:    (field: string) => LiveHolder | null;
+    bodyCollab?: RichCollab;
+    bodyUnsaved?: boolean;
     presence:    ReactNode;
     onChange:    (draft: EditDraft) => void;
     onAddPerson: () => void;
@@ -715,7 +733,13 @@ function DraftView({ draft, saving, error, enter, lockedBy, presence, onChange, 
                         onChange={v => onChange({ ...draft, body: v })}
                         maxLength={12000}
                         placeholder={t('mdt.narrativeHint', 'What happened, in the order it happened.')}
+                        collab={bodyCollab}
                     />
+                )}
+                {bodyUnsaved && bodyCollab && (
+                    <div className="mt-1 px-1 text-[12px] text-ios-gray">
+                        {t('mdt.sharedUnsaved', 'Shared draft, not filed yet. Save files it for everyone.')}
+                    </div>
                 )}
             </div>
 

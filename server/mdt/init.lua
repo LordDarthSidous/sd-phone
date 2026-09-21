@@ -158,6 +158,9 @@ local ROUTES = {
     { 'live:lock',           live,      'lock' },
     { 'live:unlock',         live,      'unlock' },
     { 'live:draft',          live,      'draft' },
+    { 'live:op',             live,      'op' },
+    { 'live:caret',          live,      'caret' },
+    { 'live:sync',           live,      'sync' },
 
     { 'offences:list',       offences,  'list' },
     { 'offences:save',       offences,  'save' },
