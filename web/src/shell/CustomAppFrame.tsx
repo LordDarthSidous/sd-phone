@@ -20,6 +20,8 @@ import { uploadVoiceMessage } from '@/shared/chat/messagesApi';
 import { GifPickerSheet } from '@/shared/chat/GifPickerSheet';
 import { ContactPickerSheet } from '@/shared/ContactPickerSheet';
 import { formatPhone } from '@/apps/phone/data';
+import { accentVars } from '@/apps/settings/appearance/accentRamp';
+import { isCustomPaletteId, rampFor, rampVars } from '@/apps/settings/appearance/paletteRamp';
 import { Camera } from '@/apps/camera/Camera';
 import { AppIconSVG } from './AppIconSVG';
 import { useDeckActive } from './deckActive';
@@ -68,6 +70,22 @@ function blobToDataUrl(blob: Blob): Promise<string> {
     });
 }
 
+function applyPhoneTheme(body: HTMLElement) {
+    const s = useThemeStore.getState();
+    const mode = s.theme === 'dark' ? 'dark' : 'light';
+    body.setAttribute('data-theme', mode);
+    body.setAttribute('data-dark-theme', s.darkTheme);
+    body.setAttribute('data-light-theme', s.lightTheme);
+    const vars: Record<string, string> = accentVars(mode, s.accent);
+    const activeId = mode === 'dark' ? s.darkTheme : s.lightTheme;
+    if (isCustomPaletteId(activeId)) {
+        const palette = s.customPalettes.find(p => p.id === activeId);
+        if (palette) Object.assign(vars, rampVars(rampFor(palette.mode, palette)));
+    }
+    for (const name of Array.from(body.style)) if (name.startsWith('--')) body.style.removeProperty(name);
+    for (const [name, value] of Object.entries(vars)) body.style.setProperty(name, value);
+}
+
 function buildSettings(): Record<string, unknown> {
     const s = useThemeStore.getState();
     return {
@@ -110,7 +128,7 @@ const SWATCHES = [
 
 export function CustomAppFrame({ appId, onClose }: { appId: string; onClose: () => void }) {
     const def = useCustomAppsStore(s => s.apps.find(a => a.id === appId));
-    const { theme, airplaneMode, hour24, brightness } = useTheme('theme', 'airplaneMode', 'hour24', 'brightness');
+    const { theme, darkTheme, lightTheme, accent, customPalettes, airplaneMode, hour24, brightness } = useTheme('theme', 'darkTheme', 'lightTheme', 'accent', 'customPalettes', 'airplaneMode', 'hour24', 'brightness');
     const active = useDeckActive();
 
     const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -511,7 +529,7 @@ export function CustomAppFrame({ appId, onClose }: { appId: string; onClose: () 
                 doc.body.style.padding = '0';
                 doc.body.style.width = '100%';
                 doc.body.style.height = '100%';
-                doc.body.setAttribute('data-theme', theme);
+                applyPhoneTheme(doc.body);
                 doc.body.setAttribute('data-device', 'phone');
             }
             win.resourceName      = d.resource;
@@ -554,17 +572,18 @@ export function CustomAppFrame({ appId, onClose }: { appId: string; onClose: () 
             console.warn('[sd-phone] custom-app iframe injection failed (expected outside FiveM)', err);
         }
         setReady(true);
-    }, [theme, bridge, setApp, markSdkReady]);
+    }, [bridge, setApp, markSdkReady]);
 
     useEffect(() => {
         if (!loadedRef.current) return;
         const iframe = iframeRef.current;
         if (!iframe) return;
         try {
-            iframe.contentDocument?.body?.setAttribute('data-theme', theme);
+            const body = iframe.contentDocument?.body;
+            if (body) applyPhoneTheme(body);
         } catch { /* cross-origin */ }
         postToApp({ type: 'settingsUpdated', settings: buildSettings() });
-    }, [theme, airplaneMode, hour24, brightness, postToApp]);
+    }, [theme, darkTheme, lightTheme, accent, customPalettes, airplaneMode, hour24, brightness, postToApp]);
 
     useEffect(() => {
         function onFrameMessage(event: MessageEvent) {
