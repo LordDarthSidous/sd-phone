@@ -11,6 +11,8 @@ local uploader   = require 'server.photos.uploader'
 local mediaLimit = require 'server.photos.mediaLimit'
 ---@type table Presigned upload slots (server.photos.presign): mint + claim for the direct path.
 local presign    = require 'server.photos.presign'
+---@type table HTTP upload ingest (server.media.httpUpload): single-use slots on the server's HTTP port.
+local httpUpload = require 'server.media.httpUpload'
 ---@type table Media trust boundary: remembers uploader-returned voicemail URLs for delivery.
 local mediaGuard = require 'server.media.guard'
 ---@type table Player bridge (bridge.server.player): citizenid for the shared upload budget.
@@ -90,17 +92,22 @@ lib.callback.register('sd-phone:server:voicemail:uploadDone', function(src, payl
     return util.ok({ url = trustedUrl })
 end)
 
----Hosts a finished voicemail recording and hands the caller back its URL, which they then pass to
----`voicemail:leave`. Split in two rather than uploading and delivering in one call because the
----URL is what makes a message re-sendable: a delivery refused for a full mailbox or a rate limit
----does not have to pay for the upload twice. Kept as the fallback for the direct pair above.
----@param src number player server id
----@param payload table { audio: string } base64 audio data-URL from the NUI recorder
----@return table result { success, message?, data = { url } }
-lib.callback.register('sd-phone:server:voicemail:upload', function(src, payload)
-    payload = type(payload) == 'table' and payload or {}
-    local audio = payload.audio
+---The refusal envelope for an upload the budget or pacing turned away.
+---@param why string|nil 'cooldown'|'busy'|'identity'|'budget'|'server'
+---@return table envelope
+local function refusal(why)
+    if why == 'cooldown' then return util.fail('voicemail.slowDownMoment', 'Slow down a moment') end
+    if why == 'busy' then return util.fail('voicemail.uploadInProgress', 'Upload already in progress') end
+    return util.fail('voicemail.uploadLimitReached', 'Upload limit reached, try again later')
+end
 
+---Hosts a recorded voicemail and answers with its trusted URL, which the caller then passes to
+---`voicemail:leave`.
+---@param src number player server id
+---@param audio any base64 audio data-URL as the client sent it
+---@param prepaid boolean|nil true when an HTTP slot already holds the budget for it
+---@return table result { success, message?, data = { url } }
+local function host(src, audio, prepaid)
     if type(audio) ~= 'string' or not lib.string.startsWith(audio, 'data:audio/') then
         return util.fail('voicemail.badAudio', 'Bad audio payload')
     end
@@ -111,11 +118,9 @@ lib.callback.register('sd-phone:server:voicemail:upload', function(src, payload)
         return util.fail('voicemail.uploadInProgress', 'Upload already in progress')
     end
 
-    local okLimit, why = mediaLimit.charge(src, #audio)
-    if not okLimit then
-        return why == 'cooldown'
-            and util.fail('voicemail.slowDownMoment', 'Slow down a moment')
-            or util.fail('voicemail.uploadLimitReached', 'Upload limit reached, try again later')
+    if not prepaid then
+        local okLimit, why = mediaLimit.charge(src, #audio)
+        if not okLimit then return refusal(why) end
     end
 
     local ext = audio:find('^data:audio/mpeg') and 'mp3'
@@ -137,4 +142,26 @@ lib.callback.register('sd-phone:server:voicemail:upload', function(src, payload)
     local trustedUrl = mediaGuard.rememberVoice(player.getIdentifier(src), result.url)
     if not trustedUrl then return util.fail('voicemail.uploadFailed', 'Upload failed') end
     return util.ok({ url = trustedUrl })
+end
+
+---The base64 route for hosting a voicemail, for a phone that could not reach the HTTP port.
+---@param src number player server id
+---@param payload table { audio: string } base64 audio data-URL from the NUI recorder
+---@return table result { success, message?, data = { url } }
+lib.callback.register('sd-phone:server:voicemail:upload', function(src, payload)
+    payload = type(payload) == 'table' and payload or {}
+    return host(src, payload.audio)
+end)
+
+---React -> server: open an HTTP upload slot for a voicemail. The last part is answered with the
+---hosted URL, exactly as the base64 route answers.
+---@param src number player server id
+---@return table result { success, message?, data = { path, partBytes } }
+lib.callback.register('sd-phone:server:voicemail:httpSlot', function(src)
+    if uploading[src] then return refusal('busy') end
+    local slot, why = httpUpload.mint(src, MAX_AUDIO_BYTES, function(owner, body)
+        return host(owner, body, true)
+    end)
+    if not slot then return refusal(why) end
+    return util.ok(slot)
 end)

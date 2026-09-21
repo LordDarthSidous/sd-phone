@@ -1,3 +1,6 @@
+---@type table Upload budget (server.photos.mediaLimit): holds a slot's worst case until its body arrives.
+local mediaLimit = require 'server.photos.mediaLimit'
+
 ---@type table HTTP upload ingest; the table returned at end of file. Takes a recording from the
 ---phone over the server's own HTTP port, so its bytes never travel as a game network event.
 local httpUpload = {}
@@ -9,7 +12,8 @@ local httpUpload = {}
 ---@field parts string[] Parts received so far, in order.
 ---@field received integer Bytes received so far.
 ---@field busy boolean True while a part's body is still arriving.
----@field onBody fun(src: integer, body: string) Receives the assembled body once the last part lands.
+---@field ticket table|nil Budget reservation, settled at the bytes that actually arrived.
+---@field onBody fun(src: integer, body: string): table|nil Takes the assembled body; its answer goes back to the phone.
 
 ---@type integer Seconds a slot survives without a part arriving.
 local SLOT_TTL <const> = 60
@@ -18,11 +22,20 @@ local SLOT_TTL <const> = 60
 ---is over 5 MiB, measured 2026-09-21: 5120 KB arrives and 5200 KB is cut off.
 local MAX_PART_BYTES <const> = 4 * 1024 * 1024
 
+---@type integer Slots one player may hold at once, so a photo does not cancel a recording mid-send.
+local MAX_SLOTS_PER_PLAYER <const> = 3
+
+---@type integer Milliseconds between two slots for one player.
+local MINT_GAP_MS <const> = 1000
+
 ---@type table<string, HttpUploadSlot> Live slots by token.
 local slots = {}
 
----@type table<integer, string> Token of each player's live slot; one slot per player.
-local tokenOf = {}
+---@type table<integer, table<string, boolean>> Tokens each player holds.
+local owned = {}
+
+---@type table<integer, integer> GetGameTimer() of each player's last slot.
+local lastMint = {}
 
 ---@type table<string, string> Headers sent on every answer, so the phone's page may read it.
 local CORS <const> = {
@@ -40,35 +53,58 @@ local function newToken()
         math.random(0, 0xFFFFFFFF), math.random(0, 0xFFFFFFFF))
 end
 
----Closes a slot.
+---Closes a slot, settling its budget at the bytes that arrived.
 ---@param token string
 local function close(token)
     local slot = slots[token]
     if not slot then return end
     slots[token] = nil
-    if tokenOf[slot.src] == token then tokenOf[slot.src] = nil end
+    if owned[slot.src] then owned[slot.src][token] = nil end
+    if slot.ticket then mediaLimit.settle(slot.ticket, slot.received) end
 end
 
----Closes a player's live slot, if any.
+---Closes every slot a player holds.
 ---@param src integer
 function httpUpload.forget(src)
-    local token = tokenOf[src]
-    if token then close(token) end
+    for token in pairs(owned[src] or {}) do close(token) end
+    owned[src] = nil
 end
 
----Opens an upload slot for a player, replacing any slot they already hold.
+---Opens an upload slot for a player, holding their upload budget for its worst case until the body
+---arrives. Refused while they are pacing, holding too many slots, or out of budget.
 ---@param src integer
 ---@param maxBytes integer Largest assembled body to accept.
----@param onBody fun(src: integer, body: string) Called with the assembled body once it has arrived.
----@return table slot { path: string, partBytes: integer } where to POST and how large a part may be.
+---@param onBody fun(src: integer, body: string): table|nil Called with the assembled body once it has arrived.
+---@return table|nil slot { path: string, partBytes: integer }
+---@return string|nil reason 'cooldown'|'busy'|'identity'|'budget'|'server'
 function httpUpload.mint(src, maxBytes, onBody)
-    httpUpload.forget(src)
+    local now = GetGameTimer()
+    if lastMint[src] and now - lastMint[src] < MINT_GAP_MS then return nil, 'cooldown' end
+
+    local mine = owned[src] or {}
+    owned[src] = mine
+    local held, idle = 0, nil
+    for token in pairs(mine) do
+        local slot = slots[token]
+        held = held + 1
+        if slot and slot.received == 0 and not slot.busy
+            and (not idle or slot.expires < slots[idle].expires) then idle = token end
+    end
+    if held >= MAX_SLOTS_PER_PLAYER then
+        if not idle then return nil, 'busy' end
+        close(idle)
+    end
+
+    local ok, why, ticket = mediaLimit.reserve(src, maxBytes)
+    if not ok then return nil, why end
+
+    lastMint[src] = now
     local token = newToken()
     slots[token] = {
         src = src, maxBytes = maxBytes, expires = os.time() + SLOT_TTL,
-        parts = {}, received = 0, busy = false, onBody = onBody,
+        parts = {}, received = 0, busy = false, ticket = ticket, onBody = onBody,
     }
-    tokenOf[src] = token
+    mine[token] = true
     return { path = '/upload/' .. token, partBytes = MAX_PART_BYTES }
 end
 
@@ -87,6 +123,21 @@ end
 local function contentLength(headers)
     if type(headers) ~= 'table' then return nil end
     return math.tointeger(tonumber(headers['Content-Length'] or headers['content-length']))
+end
+
+---Hands an assembled body to the slot's owner and answers the last part with what the owner said.
+---@param res table FXServer HTTP response.
+---@param slot HttpUploadSlot
+---@param body string
+local function deliver(res, slot, body)
+    CreateThread(function()
+        local ok, result = pcall(slot.onBody, slot.src, body)
+        if not ok then
+            print(('^1[sd-phone:media]^0 upload handler failed: %s'):format(tostring(result)))
+            result = { success = false }
+        end
+        reply(res, 200, { ok = true, result = type(result) == 'table' and result or { success = true } })
+    end)
 end
 
 ---Serves POST /upload/<token>/<part>/<total>: parts arrive in order, one at a time, and the last
@@ -124,12 +175,12 @@ SetHttpHandler(function(req, res)
         slot.parts[part] = body
         slot.received = slot.received + #body
         slot.expires = os.time() + SLOT_TTL
-        reply(res, 200, { ok = true })
 
-        if part == total then
-            close(token)
-            slot.onBody(slot.src, table.concat(slot.parts))
-        end
+        if part < total then return reply(res, 200, { ok = true }) end
+
+        local assembled = table.concat(slot.parts)
+        close(token)
+        deliver(res, slot, assembled)
     end)
 end)
 
@@ -144,7 +195,10 @@ CreateThread(function()
     end
 end)
 
----Drops a departing player's slot.
-AddEventHandler('playerDropped', function() httpUpload.forget(source) end)
+---Drops a departing player's slots.
+AddEventHandler('playerDropped', function()
+    httpUpload.forget(source)
+    lastMint[source] = nil
+end)
 
 return httpUpload

@@ -1,5 +1,5 @@
 import { fetchNui, isFiveM } from '@/core/nui';
-import { uploadDirect } from '@/shared/mediaUpload';
+import { uploadDirect, uploadViaServer } from '@/shared/mediaUpload';
 import { LiveAudioMixer } from '@/media/audioMixer';
 import { CallPeer, fetchIceConfig, type Signal } from './webrtc';
 
@@ -185,6 +185,8 @@ class CallRecorder {
             done: 'sd-phone:callrec:uploadDone',
         }, details);
         if (hosted) return { ok: true, oneSided, seconds };
+
+        if (await uploadViaServer(blob, 'sd-phone:callrec:httpSlot', details)) return { ok: true, oneSided, seconds };
 
         const dataUrl = await toDataUrl(blob);
         if (!dataUrl) return { ok: false, oneSided, seconds, error: 'Could not read the recording' };

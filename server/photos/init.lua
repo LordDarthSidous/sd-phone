@@ -11,6 +11,8 @@ local actions  = require 'server.photos.actions'
 local uploader = require 'server.photos.uploader'
 ---@type table Presigned upload slots (server.photos.presign): mint + claim for the direct path.
 local presign  = require 'server.photos.presign'
+---@type table HTTP upload ingest (server.media.httpUpload): single-use slots on the server's HTTP port.
+local httpUpload = require 'server.media.httpUpload'
 ---@type table Media URL ledger (server.media.ledger): schema + one-time backfill at boot.
 local ledger   = require 'server.media.ledger'
 ---@type table Player bridge (bridge.server.player): citizenid for the shared upload budget.
@@ -166,7 +168,8 @@ end
 ---@param src number player the capture came from
 ---@param image string base64 data-URL (data:image/... or data:video/...)
 ---@param isVideo boolean whether the payload is a clip rather than a still
-local function startUpload(src, image, isVideo)
+---@param prepaid boolean|nil true when an HTTP slot already holds the budget for it
+local function startUpload(src, image, isVideo, prepaid)
     local prefix  = isVideo and 'data:video/' or 'data:image/'
     if type(image) ~= 'string' or image:sub(1, #prefix) ~= prefix then
         uploadFailed(src, 'bad-data', ('not a %s data-URL'):format(isVideo and 'video' or 'image'))
@@ -180,12 +183,13 @@ local function startUpload(src, image, isVideo)
         uploadFailed(src, 'busy', 'an upload is already in progress')
         return
     end
-    local okLimit, why = mediaLimit.charge(src, #image)
-    if not okLimit then
-        uploadFailed(src, 'rate-limit', ('rate limit (%s)'):format(tostring(why)))
-        return
+    if not prepaid then
+        local okLimit, why = mediaLimit.charge(src, #image)
+        if not okLimit then
+            uploadFailed(src, 'rate-limit', ('rate limit (%s)'):format(tostring(why)))
+            return
+        end
     end
-
 
     local ext = 'jpg'
     if isVideo then
@@ -211,6 +215,26 @@ RegisterNetEvent('sd-phone:server:photos:upload', function(image)
     local src = source
     if type(image) == 'string' then logUpload(src, 'photo', #image, 1, nil) end
     startUpload(src, image, false)
+end)
+
+---React -> server: open an HTTP upload slot for a photo or a clip, sized for the larger of the two
+---caps only when a clip is announced.
+---@param payload table { kind: 'photo'|'clip' }
+lib.callback.register('sd-phone:server:photos:httpSlot', function(src, payload)
+    local isVideo = type(payload) == 'table' and payload.kind == 'clip'
+    local slot, why = nil, 'busy'
+    if not uploading[src] then
+        slot, why = httpUpload.mint(src, isVideo and MAX_VIDEO_BYTES or MAX_PHOTO_BYTES, function(owner, body)
+            logUpload(owner, isVideo and 'clip' or 'photo', #body, 1, nil)
+            startUpload(owner, body, isVideo, true)
+            return { success = true }
+        end)
+    end
+    if not slot then
+        uploadFailed(src, why == 'busy' and 'busy' or 'rate-limit', ('upload slot refused (%s)'):format(tostring(why)))
+        return { success = false, code = why }
+    end
+    return { success = true, data = slot }
 end)
 
 -- Sliced clip upload. A whole clip is megabytes, and one latent event that size blocks the net

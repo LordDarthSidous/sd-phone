@@ -2,7 +2,7 @@ import { apiCall, failText } from '@/core/api';
 import { t } from '@/i18n';
 import { getGameRender, type GameRender } from '@/render';
 import { pickVideoMime, videoStreamingSupported } from '@/shared/liveMedia';
-import { uploadDirect } from '@/shared/mediaUpload';
+import { uploadDirect, uploadViaServer } from '@/shared/mediaUpload';
 
 export interface RecorderMeta {
     cameraId: string;
@@ -116,6 +116,8 @@ async function upload(blob: Blob, mime: string, duration: number, forMeta: Recor
         done: 'sd-phone:mdt:recDone',
     }, meta);
     if (hosted) return;
+
+    if (await uploadViaServer(blob, 'sd-phone:mdt:recHttpSlot', meta)) return;
 
     const begun = await apiCall('sd-phone:mdt:recBegin', {
         cameraId: forMeta.cameraId,

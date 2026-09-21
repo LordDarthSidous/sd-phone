@@ -1,5 +1,5 @@
 import { isFiveM } from '@/core/nui';
-import { uploadDirect } from '@/shared/mediaUpload';
+import { uploadDirect, uploadViaServer } from '@/shared/mediaUpload';
 import { apiCall, apiData, type Envelope } from '@/core/api';
 
 export interface Voicemail {
@@ -75,6 +75,8 @@ export async function uploadVoicemail(audio: string, blob?: Blob): Promise<Envel
         if (hosted) return { success: true, data: { url: hosted } };
     }
 
+    const viaServer = await uploadViaServer<{ url: string }>(audio, 'sd-phone:voicemail:httpSlot');
+    if (viaServer) return viaServer;
     return await apiCall<{ url: string }>('sd-phone:voicemail:upload', { audio });
 }
 

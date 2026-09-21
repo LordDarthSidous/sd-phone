@@ -31,6 +31,7 @@ lib.callback.register('sd-phone:server:messages:send', function(src, payload) re
 lib.callback.register('sd-phone:server:messages:uploadVoice', function(src, payload) return actions.uploadVoice(src, payload) end)
 lib.callback.register('sd-phone:server:messages:voiceSlot', function(src) return actions.voiceSlot(src) end)
 lib.callback.register('sd-phone:server:messages:voiceDone', function(src, payload) return actions.voiceDone(src, payload) end)
+lib.callback.register('sd-phone:server:messages:httpSlot', function(src) return actions.voiceHttpSlot(src) end)
 lib.callback.register('sd-phone:server:messages:createGroup', function(src, payload) return actions.createGroup(src, payload) end)
 lib.callback.register('sd-phone:server:messages:addGroupMember', function(src, payload) return actions.addGroupMember(src, payload) end)
 lib.callback.register('sd-phone:server:messages:updateGroup', function(src, payload) return actions.updateGroup(src, payload) end)

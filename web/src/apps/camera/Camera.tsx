@@ -19,7 +19,7 @@ import { useSessionState } from '@/hooks/useSessionState';
 import { HINT_DEFAULTS, KeyHints, type HintConfig } from '@/ui/KeyHints';
 import { clampZoom, ZOOM_KEY_STEP, ZOOM_PRESETS, ZOOM_WHEEL_RATE, zoomLabel } from '@/shared/lens';
 import { encodeSlice, sliceCount, SLICE_BYTES } from '@/shared/mediaSlice';
-import { uploadDirect } from '@/shared/mediaUpload';
+import { uploadDirect, uploadViaServer } from '@/shared/mediaUpload';
 import { CAMERA_FILTERS, filterCss, filterLabel } from './filters';
 import { FilterDefs } from './FilterDefs';
 
@@ -492,8 +492,10 @@ export function Camera({ onClose, onLandscapeChange, onOpenApp, photoOnly = fals
             if (!image) { setPending(false); return; }
             setUploadError(null);
 
-            const res = await apiCall<void>('sd-phone:camera:capture', { image });
-            if (!res.success) { setPending(false); return; }
+            if (!(await uploadViaServer(image, 'sd-phone:camera:httpSlot', { kind: 'photo' }))) {
+                const res = await apiCall<void>('sd-phone:camera:capture', { image });
+                if (!res.success) { setPending(false); return; }
+            }
 
             captureTimer.current = setTimeout(() => setPending(false), CAPTURE_TIMEOUT_MS);
         } catch {
@@ -611,7 +613,8 @@ export function Camera({ onClose, onLandscapeChange, onOpenApp, photoOnly = fals
         setPending(true);
         try {
             const ext = type === 'video/mp4' ? 'mp4' : 'webm';
-            const hosted = await uploadDirect(blob, `sdphone-${Date.now()}.${ext}`, DIRECT_UPLOAD);
+            const hosted = await uploadDirect(blob, `sdphone-${Date.now()}.${ext}`, DIRECT_UPLOAD)
+                || await uploadViaServer(blob, 'sd-phone:camera:httpSlot', { kind: 'clip' });
             if (hosted) {
                 captureTimer.current = setTimeout(() => setPending(false), VIDEO_TIMEOUT_MS);
                 return;

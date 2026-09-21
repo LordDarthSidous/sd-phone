@@ -1,6 +1,6 @@
 
 import { fetchNui, isFiveM } from '@/core/nui';
-import { uploadDirect } from '@/shared/mediaUpload';
+import { uploadDirect, uploadViaServer } from '@/shared/mediaUpload';
 import { colorFor, digits, initialsFor } from '@/lib/format';
 import { formatPhone } from '@/apps/phone/data';
 import { isServiceShortCode } from '@/lib/phone';
@@ -126,6 +126,9 @@ export async function uploadVoiceMessage(audio: string, blob?: Blob): Promise<st
         });
         if (hosted) return hosted;
     }
+
+    const viaServer = await uploadViaServer<{ url: string }>(audio, 'sd-phone:messages:httpSlot');
+    if (viaServer) return viaServer.success ? viaServer.data?.url ?? null : null;
 
     return (await apiData<{ url: string }>('sd-phone:messages:uploadVoice', { audio }))?.url ?? null;
 }

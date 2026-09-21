@@ -16,6 +16,7 @@ import { AlertDialog } from '@/ui/AlertDialog';
 import { PromptDialog } from '@/ui/PromptDialog';
 import { MediaPickerSheet } from '@/shared/MediaPickerSheet';
 import { EmojiPanel } from '@/shared/chat/EmojiPanel';
+import { uploadVoiceMessage } from '@/shared/chat/messagesApi';
 import { GifPickerSheet } from '@/shared/chat/GifPickerSheet';
 import { ContactPickerSheet } from '@/shared/ContactPickerSheet';
 import { formatPhone } from '@/apps/phone/data';
@@ -243,7 +244,7 @@ export function CustomAppFrame({ appId, onClose }: { appId: string; onClose: () 
         try {
             const dataUrl = await blobToDataUrl(blob);
             if (type === 'audio' || type === 'voice') {
-                return (await apiData<{ url: string }>('sd-phone:messages:uploadVoice', { audio: dataUrl }))?.url ?? null;
+                return await uploadVoiceMessage(dataUrl, blob);
             }
             return (await apiData<{ url: string }>('sd-phone:media:upload', { type, data: dataUrl }))?.url ?? null;
         } catch {

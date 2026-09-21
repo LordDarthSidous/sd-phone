@@ -1,5 +1,7 @@
----@type fun(nuiAction: string, serverEvent: string) NUI->server pass-through registrar (client.nui).
+---@type fun(nuiAction: string, serverEvent: string, onAccepted?: fun(), transform?: fun(res: table)) NUI->server pass-through registrar (client.nui).
 local proxy = require 'client.nui'
+---@type fun(res: table) Completes an HTTP upload slot with this client's server address (client.uploadurl).
+local uploadUrl = require 'client.uploadurl'
 
 -- Thin delegates into server/voicememos.
 proxy('sd-phone:voice:list',   'sd-phone:server:voice:list')
@@ -36,17 +38,5 @@ end)
 proxy('sd-phone:voice:uploadSlot', 'sd-phone:server:voice:uploadSlot')
 proxy('sd-phone:voice:uploadDone', 'sd-phone:server:voice:uploadDone')
 
----React -> Lua: open an HTTP upload slot for a memo. Returns the full URL on the server this
----client is connected to, which only the client knows.
----@param payload table { name?: string, duration?: number }
-RegisterNUICallback('sd-phone:voice:httpSlot', function(payload, cb)
-    local res = lib.callback.await('sd-phone:server:voice:httpSlot', false, payload)
-    local endpoint = GetCurrentServerEndpoint()
-    if type(res) ~= 'table' or not res.success or not res.data or not endpoint or endpoint == '' then
-        return cb({ success = false, code = type(res) == 'table' and res.code or 'unavailable' })
-    end
-    cb({ success = true, data = {
-        url = ('http://%s/%s%s'):format(endpoint, GetCurrentResourceName(), res.data.path),
-        partBytes = res.data.partBytes,
-    } })
-end)
+-- HTTP upload: the recording goes to the server over its HTTP port instead of a game network event.
+proxy('sd-phone:voice:httpSlot', 'sd-phone:server:voice:httpSlot', nil, uploadUrl)

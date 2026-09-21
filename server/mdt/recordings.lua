@@ -20,6 +20,8 @@ local player   = require 'bridge.server.player'
 local photos   = require 'server.photos.store'
 ---@type table Presigned upload slots (server.photos.presign): mint + claim for the direct path.
 local presign  = require 'server.photos.presign'
+---@type table HTTP upload ingest (server.media.httpUpload): single-use slots on the server's HTTP port.
+local httpUpload = require 'server.media.httpUpload'
 ---@type table Notifications (server.notifications.init): the banner a recipient sees on the phone
 ---itself, so footage sent to somebody who is not looking at their terminal is still noticed.
 local notifications = require 'server.notifications.init'
@@ -284,6 +286,50 @@ local function saveRow(src, url, meta, bytes)
     }
 end
 
+---The sentence an officer sees when the upload budget or pacing refuses them.
+---@param why string|nil 'cooldown'|'busy'|'identity'|'budget'|'server'
+---@return string message
+local function refusal(why)
+    if why == 'cooldown' then return 'Slow down a moment' end
+    if why == 'busy' then return 'An upload is already in progress' end
+    return 'Upload limit reached, try again later'
+end
+
+---Hosts a finished recording and files its row, reporting either outcome to the terminal.
+---@param src integer uploading terminal
+---@param dataUrl string the whole recording as a data:video/ URL
+---@param meta table settled by buildMeta
+---@param prepaid boolean|nil true when an HTTP slot already holds the budget for it
+local function host(src, dataUrl, meta, prepaid)
+    if not prepaid then
+        local okLimit, why = mediaLimit.charge(src, #dataUrl)
+        if not okLimit then
+            TriggerClientEvent('sd-phone:client:mdt:recFailed', src, refusal(why))
+            return
+        end
+    end
+
+    local ext = meta.mime:find('mp4') and 'mp4' or 'webm'
+    local filename = ('sdphone-bodycam-%s-%d.%s'):format(meta.officerCid, os.time(), ext)
+
+    uploading[src] = true
+    uploader.uploadMedia(dataUrl, filename, function(url, err)
+        uploading[src] = nil
+        if not url then
+            print(('^1[sd-phone:mdt]^0 bodycam upload failed: %s'):format(tostring(err)))
+            TriggerClientEvent('sd-phone:client:mdt:recFailed', src, err or 'Upload failed')
+            return
+        end
+
+        local row = saveRow(src, url, meta, #dataUrl)
+        if row then
+            TriggerClientEvent('sd-phone:client:mdt:recSaved', src, row)
+        else
+            TriggerClientEvent('sd-phone:client:mdt:recFailed', src, 'Could not save the recording')
+        end
+    end)
+end
+
 ---Assembles the slices in sequence order and hands the result to the uploader.
 ---
 ---Order matters and cannot be assumed: latent events are paced onto the wire independently and
@@ -313,34 +359,7 @@ local function finish(src)
     -- Each slice is the base64 of a byte run whose length divides by 3, so no slice but the last
     -- carries padding and joining the strings reproduces the base64 of the whole file exactly.
     local payload = table.concat(parts)
-    local dataUrl = ('data:%s;base64,%s'):format(job.meta.mime, payload)
-
-    local okLimit, why = mediaLimit.charge(src, #dataUrl)
-    if not okLimit then
-        TriggerClientEvent('sd-phone:client:mdt:recFailed', src,
-            why == 'cooldown' and 'Slow down a moment' or 'Upload limit reached, try again later')
-        return
-    end
-
-    local ext = job.meta.mime:find('mp4') and 'mp4' or 'webm'
-    local filename = ('sdphone-bodycam-%s-%d.%s'):format(job.meta.officerCid, os.time(), ext)
-
-    uploading[src] = true
-    uploader.uploadMedia(dataUrl, filename, function(url, err)
-        uploading[src] = nil
-        if not url then
-            print(('^1[sd-phone:mdt]^0 bodycam upload failed: %s'):format(tostring(err)))
-            TriggerClientEvent('sd-phone:client:mdt:recFailed', src, err or 'Upload failed')
-            return
-        end
-
-        local row = saveRow(src, url, job.meta, #dataUrl)
-        if row then
-            TriggerClientEvent('sd-phone:client:mdt:recSaved', src, row)
-        else
-            TriggerClientEvent('sd-phone:client:mdt:recFailed', src, 'Could not save the recording')
-        end
-    end)
+    host(src, ('data:%s;base64,%s'):format(job.meta.mime, payload), job.meta)
 end
 
 ---Settles everything the row will carry, from the camera the terminal is actually holding rather
@@ -519,6 +538,34 @@ if ENABLED then
 
         TriggerClientEvent('sd-phone:client:mdt:recSaved', src, row)
         return { success = true }
+    end)
+
+    ---React -> server: open an HTTP upload slot for a finished recording. Everything the row will
+    ---carry is settled here from the camera the terminal is holding, so the body is only the video.
+    ---@param payload table { cameraId, mime, duration, officer, callsign, plate, model }
+    lib.callback.register('sd-phone:server:mdt:recHttpSlot', function(src, payload)
+        local meta, reason = buildMeta(src, payload)
+        if not meta then
+            TriggerClientEvent('sd-phone:client:mdt:recFailed', src, reason)
+            return { success = false, code = 'refused' }
+        end
+
+        local slot, why = nil, 'busy'
+        if not uploading[src] and not assembling[src] then
+            slot, why = httpUpload.mint(src, MAX_BYTES, function(owner, body)
+                if not body:find('^data:video/') then
+                    TriggerClientEvent('sd-phone:client:mdt:recFailed', owner, 'The recording did not arrive in full')
+                    return { success = false }
+                end
+                host(owner, body, meta, true)
+                return { success = true }
+            end)
+        end
+        if not slot then
+            TriggerClientEvent('sd-phone:client:mdt:recFailed', src, refusal(why))
+            return { success = false, code = why }
+        end
+        return { success = true, data = slot }
     end)
 
     util.onCleanup(function(src)

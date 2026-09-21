@@ -10,6 +10,8 @@ local uploader   = require 'server.photos.uploader'
 local mediaLimit = require 'server.photos.mediaLimit'
 ---@type table Presigned upload slots (server.photos.presign): mint + claim for the direct path.
 local presign    = require 'server.photos.presign'
+---@type table HTTP upload ingest (server.media.httpUpload): single-use slots on the server's HTTP port.
+local httpUpload = require 'server.media.httpUpload'
 ---@type table Call recording config (configs.callrec).
 local cfg        = require 'configs.callrec'
 ---@type table Shared server helpers (server.util): the ok/fail envelopes.
@@ -117,16 +119,21 @@ end)
 
 AddEventHandler('playerDropped', function() pendingDirect[source] = nil end)
 
----Receives a finished recording as a base64 audio data URL, hosts it, and stores the row. The
----whole file arrives in one event: a call recording has no live viewer, so unlike the bodycam
----relay there is nothing to gain from streaming it in chunks and nothing to reassemble.
-RegisterNetEvent('sd-phone:server:callrec:upload', function(payload)
-    local src = source
-    if not cfg.Enabled then return end
+---The sentence a player sees when the upload budget or pacing refuses them.
+---@param why string|nil 'cooldown'|'busy'|'identity'|'budget'|'server'
+---@return string message
+local function refusal(why)
+    if why == 'cooldown' then return 'Slow down a moment' end
+    if why == 'busy' then return 'Upload already in progress' end
+    return 'Upload limit reached, try again later'
+end
 
-    payload = type(payload) == 'table' and payload or {}
-    local audio = payload.audio
-
+---Takes a finished recording as a base64 audio data URL, hosts it, and stores the row.
+---@param src integer
+---@param audio any The data URL as the client sent it.
+---@param meta table call details the row carries
+---@param prepaid boolean|nil true when an HTTP slot already holds the budget for it
+local function ingest(src, audio, meta, prepaid)
     if type(audio) ~= 'string' or not lib.string.startsWith(audio, 'data:audio/') then
         TriggerClientEvent('sd-phone:client:callrec:failed', src, 'Bad audio payload')
         return
@@ -140,11 +147,12 @@ RegisterNetEvent('sd-phone:server:callrec:upload', function(payload)
         return
     end
 
-    local okLimit, why = mediaLimit.charge(src, #audio)
-    if not okLimit then
-        TriggerClientEvent('sd-phone:client:callrec:failed', src,
-            why == 'cooldown' and 'Slow down a moment' or 'Upload limit reached, try again later')
-        return
+    if not prepaid then
+        local okLimit, why = mediaLimit.charge(src, #audio)
+        if not okLimit then
+            TriggerClientEvent('sd-phone:client:callrec:failed', src, refusal(why))
+            return
+        end
     end
 
     local ext = audio:find('^data:audio/mpeg') and 'mp3'
@@ -161,13 +169,43 @@ RegisterNetEvent('sd-phone:server:callrec:upload', function(payload)
             TriggerClientEvent('sd-phone:client:callrec:failed', src, err or 'Upload failed')
             return
         end
-        local rec = actions.saveUploaded(src, url, payload)
+        local rec = actions.saveUploaded(src, url, meta)
         if rec then
             TriggerClientEvent('sd-phone:client:callrec:added', src, rec)
         else
             TriggerClientEvent('sd-phone:client:callrec:failed', src, 'Could not save the recording')
         end
     end)
+end
+
+---Audio upload over a game network event: the fallback for a phone that could not reach the
+---server's HTTP port.
+---@param payload table { audio: string, duration, oneSided, peerNumber, peerName, direction }
+RegisterNetEvent('sd-phone:server:callrec:upload', function(payload)
+    if not cfg.Enabled then return end
+    payload = type(payload) == 'table' and payload or {}
+    ingest(source, payload.audio, payload)
+end)
+
+---React -> server: open an HTTP upload slot for a recording. The call details are settled here,
+---so the body that follows is nothing but the audio.
+---@param payload table { duration, oneSided, peerNumber, peerName, direction }
+lib.callback.register('sd-phone:server:callrec:httpSlot', function(src, payload)
+    if not cfg.Enabled then return { success = false, code = 'unavailable' } end
+    local meta = type(payload) == 'table' and payload or {}
+
+    local slot, why = nil, 'busy'
+    if not uploading[src] then
+        slot, why = httpUpload.mint(src, MAX_AUDIO_BYTES, function(owner, body)
+            ingest(owner, body, meta, true)
+            return { success = true }
+        end)
+    end
+    if not slot then
+        TriggerClientEvent('sd-phone:client:callrec:failed', src, refusal(why))
+        return { success = false, code = why }
+    end
+    return { success = true, data = slot }
 end)
 
 AddEventHandler('playerDropped', function() uploading[source] = nil end)

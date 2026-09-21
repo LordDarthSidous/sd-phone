@@ -1,5 +1,7 @@
----@type fun(nuiAction: string, serverEvent: string) NUI->server pass-through registrar (client.nui).
+---@type fun(nuiAction: string, serverEvent: string, onAccepted?: fun(), transform?: fun(res: table)) NUI->server pass-through registrar (client.nui).
 local proxyCallback = require 'client.nui'
+---@type fun(res: table) Completes an HTTP upload slot with this client's server address (client.uploadurl).
+local uploadUrl = require 'client.uploadurl'
 
 -- Thin delegates into server/voicemail. `upload` blocks for as long as the CDN takes, which is
 -- why the recorder shows its own progress state until the envelope comes back.
@@ -22,3 +24,6 @@ end)
 -- These put it on HTTPS instead, with that route kept as the fallback.
 proxyCallback('sd-phone:voicemail:uploadSlot', 'sd-phone:server:voicemail:uploadSlot')
 proxyCallback('sd-phone:voicemail:uploadDone', 'sd-phone:server:voicemail:uploadDone')
+
+-- HTTP upload: the recording goes to the server over its HTTP port instead of a game network event.
+proxyCallback('sd-phone:voicemail:httpSlot', 'sd-phone:server:voicemail:httpSlot', nil, uploadUrl)
