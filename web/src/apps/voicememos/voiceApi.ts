@@ -1,5 +1,5 @@
 import { fetchNui, isFiveM } from '@/core/nui';
-import { uploadDirect } from '@/shared/mediaUpload';
+import { uploadDirect, uploadViaServer } from '@/shared/mediaUpload';
 import { t } from '@/i18n';
 import { apiCall, apiData } from '@/core/api';
 import { formatClockTime } from '@/lib/time';
@@ -31,18 +31,22 @@ export function uploadMemo(audioBase64: string, name: string, duration: number, 
         devMemos.unshift(memo);
         return memo;
     }
+    void sendMemo(audioBase64, name, duration, blob);
+    return null;
+}
+
+async function sendMemo(audioBase64: string, name: string, duration: number, blob?: Blob): Promise<void> {
     if (blob) {
-        void uploadDirect(blob, `sdphone-voice-${Date.now()}.webm`, {
+        const hosted = await uploadDirect(blob, `sdphone-voice-${Date.now()}.webm`, {
             slot: 'sd-phone:voice:uploadSlot',
             done: 'sd-phone:voice:uploadDone',
-        }, { name, duration }).then(hosted => {
-            if (!hosted) void fetchNui('sd-phone:voice:upload', { audio: audioBase64, name, duration });
-        });
-        return null;
+        }, { name, duration });
+        if (hosted) return;
     }
 
+    if (await uploadViaServer(audioBase64, 'sd-phone:voice:httpSlot', { name, duration })) return;
+
     void fetchNui('sd-phone:voice:upload', { audio: audioBase64, name, duration });
-    return null;
 }
 
 export function renameMemo(id: string, name: string): void {

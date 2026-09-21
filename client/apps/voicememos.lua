@@ -35,3 +35,18 @@ end)
 -- and the event path stays as the fallback for whenever that cannot run.
 proxy('sd-phone:voice:uploadSlot', 'sd-phone:server:voice:uploadSlot')
 proxy('sd-phone:voice:uploadDone', 'sd-phone:server:voice:uploadDone')
+
+---React -> Lua: open an HTTP upload slot for a memo. Returns the full URL on the server this
+---client is connected to, which only the client knows.
+---@param payload table { name?: string, duration?: number }
+RegisterNUICallback('sd-phone:voice:httpSlot', function(payload, cb)
+    local res = lib.callback.await('sd-phone:server:voice:httpSlot', false, payload)
+    local endpoint = GetCurrentServerEndpoint()
+    if type(res) ~= 'table' or not res.success or not res.data or not endpoint or endpoint == '' then
+        return cb({ success = false, code = type(res) == 'table' and res.code or 'unavailable' })
+    end
+    cb({ success = true, data = {
+        url = ('http://%s/%s%s'):format(endpoint, GetCurrentResourceName(), res.data.path),
+        partBytes = res.data.partBytes,
+    } })
+end)

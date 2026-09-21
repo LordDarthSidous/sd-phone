@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>sd-phone uploader</title>
+<script>
+(function () {
+    var trustedOrigin = 'https://cfx-nui-' + location.host;
+    var uploadUrlShape = /^http:\/\/[^\/]+\/[^\/]+\/upload\/[0-9a-f]{32}$/;
+    var smallestPartBytes = 64 * 1024;
+
+    function sendPart(url, body, part, total) {
+        return fetch(url + '/' + part + '/' + total, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            body: body,
+        });
+    }
+
+    async function sendAll(url, body, partBytes) {
+        var total = Math.max(1, Math.ceil(body.length / partBytes));
+        var status = 0;
+        for (var part = 1; part <= total; part++) {
+            var res = await sendPart(url, body.slice((part - 1) * partBytes, part * partBytes), part, total);
+            status = res.status;
+            if (!res.ok) return { ok: false, status: status };
+        }
+        return { ok: true, status: status };
+    }
+
+    window.addEventListener('message', function (event) {
+        var msg = event.data;
+        if (event.source !== window.parent || event.origin !== trustedOrigin) return;
+        if (!msg || msg.kind !== 'sd-phone:upload' || typeof msg.url !== 'string' || typeof msg.body !== 'string') return;
+        if (!uploadUrlShape.test(msg.url)) return;
+        if (typeof msg.partBytes !== 'number' || !(msg.partBytes >= smallestPartBytes)) return;
+
+        var answer = function (result) {
+            window.parent.postMessage({ kind: 'sd-phone:upload:result', id: msg.id, ok: result.ok, status: result.status }, trustedOrigin);
+        };
+
+        sendAll(msg.url, msg.body, Math.floor(msg.partBytes))
+            .then(answer)
+            .catch(function () { answer({ ok: false, status: 0 }); });
+    });
+
+    window.parent.postMessage({ kind: 'sd-phone:upload:ready' }, trustedOrigin);
+})();
+</script>

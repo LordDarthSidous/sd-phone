@@ -35,6 +35,7 @@ files {
     'client/**.lua',
     'locales/*.json',
     'web/build/index.html',
+    'web/build/uploader.html',
     'web/build/sdphone-sdk.js',
     'web/build/sdphone-sdk.d.ts',
     'web/build/assets/*.js',
