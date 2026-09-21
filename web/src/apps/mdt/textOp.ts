@@ -47,10 +47,6 @@ export function targetLength(op: TextOp): number {
     return n;
 }
 
-export function isNoop(op: TextOp): boolean {
-    return op.every(c => isRetain(c));
-}
-
 export function apply(text: string, op: TextOp): string {
     if (baseLength(op) !== text.length) throw new Error('textOp: base length mismatch');
     let out = '';
