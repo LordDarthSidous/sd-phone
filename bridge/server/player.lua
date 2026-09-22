@@ -67,13 +67,23 @@ end
 ---@type fun(p: any): string|nil Identifier extractor, bound once at load.
 local resolveIdentifier = chooseIdentifier()
 
----@type integer Milliseconds a cached identifier is served before it is re-resolved. The
+---@type integer Milliseconds a resolved identifier is served before it is re-resolved. The
 ---lifecycle handlers below keep the cache exact; this is only the backstop that stops a missed
----event from being permanent.
-local IDENTITY_TTL = 2000
+---event from being permanent. Long on purpose: every resolve copies the whole framework player
+---object across the resource boundary (~0.3ms on QBox), and a short TTL made every once-a-minute
+---pass re-resolve every connected player.
+local IDENTITY_TTL = 300000
+
+---@type integer Milliseconds a "no character" answer is served. Short, because a connecting player
+---turns into a loaded one without this module necessarily seeing the event.
+local NEGATIVE_TTL = 2000
 
 ---@type table<number, { cid: string|nil, at: number }> source -> resolved framework identifier.
 local identityCache = {}
+
+---@type table<number, { name: string, at: number }> source -> resolved display name. Same
+---lifetime and invalidation as identityCache.
+local nameCache = {}
 
 ---@type table<string, number> identifier -> source. The reverse of identityCache, so resolving a
 ---source from an identifier is a lookup instead of a walk over every connected player. Treated
@@ -93,7 +103,7 @@ local generation = 0
 ---@return string|nil
 local function cachedIdentifier(source)
     local hit = identityCache[source]
-    if hit and (GetGameTimer() - hit.at) < IDENTITY_TTL then return hit.cid end
+    if hit and (GetGameTimer() - hit.at) < (hit.cid and IDENTITY_TTL or NEGATIVE_TTL) then return hit.cid end
     local p = resolveGet(source)
     local cid = p and resolveIdentifier(p) or nil
     identityCache[source] = { cid = cid, at = GetGameTimer() }
@@ -113,6 +123,7 @@ function player.forget(source)
     -- to another source belongs to that source now.
     if hit and hit.cid and sourceIndex[hit.cid] == s then sourceIndex[hit.cid] = nil end
     identityCache[s] = nil
+    nameCache[s] = nil
     generation = generation + 1
 end
 
@@ -157,10 +168,10 @@ function player.getRealIdentifier(source)
     return cachedIdentifier(source)
 end
 
----A friendly "First Last" name for the player; 'Unknown' when the player can't be resolved.
+---Resolves the display name from the framework, uncached.
 ---@param source number player server id
 ---@return string
-function player.getName(source)
+local function resolveName(source)
     local p = resolveGet(source)
     if not p then return 'Unknown' end
 
@@ -184,6 +195,17 @@ function player.getName(source)
         return 'Unknown'
     end
     return 'Unknown'
+end
+
+---A friendly "First Last" name for the player; 'Unknown' when the player can't be resolved.
+---@param source number player server id
+---@return string
+function player.getName(source)
+    local hit = nameCache[source]
+    if hit and (GetGameTimer() - hit.at) < IDENTITY_TTL then return hit.name end
+    local name = resolveName(source)
+    if name ~= 'Unknown' then nameCache[source] = { name = name, at = GetGameTimer() } end
+    return name
 end
 
 ---The player's current job name. Nil when unresolvable. Read-only.

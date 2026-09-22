@@ -19,13 +19,24 @@ local statebags = {}
 ---about an arbitrary player from the server.
 local disabled = {}
 
+---@type table<number, table<string, any>> The last value put() published per source and key. A
+---replicated write goes out to every client in scope even when the value is unchanged, and the
+---client re-reports its whole shell state on every open, close and battery tick.
+local published = {}
+
 ---Writes one replicated key onto a player's state bag, tolerating a source that has just dropped.
+---Skips the write when the key already holds that value.
 ---@param source number player server id
 ---@param key string state bag key
 ---@param value any
 local function put(source, key, value)
     if not source or not GetPlayerName(source) then return end
-    pcall(function() Player(source).state:set(key, value, true) end)
+    local mine = published[source]
+    if mine and mine[key] == value and value ~= nil then return end
+    local ok = pcall(function() Player(source).state:set(key, value, true) end)
+    if not ok then return end
+    if not mine then mine = {}; published[source] = mine end
+    mine[key] = value
 end
 
 ---Publishes whether the phone is open. Driven from the client, which is the only side that knows.
@@ -233,6 +244,7 @@ AddEventHandler('playerDropped', function()
     put(src, 'softOpen', false)
     put(src, 'phoneDisabled', false)
     put(src, 'phoneRinging', nil)
+    published[src] = nil
 end)
 
 ---Client-reported shell state: open/soft-open/battery are only knowable on the client, so it

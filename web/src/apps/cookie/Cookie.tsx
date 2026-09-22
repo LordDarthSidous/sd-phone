@@ -110,16 +110,21 @@ export function Cookie({ onClose: _onClose }: Props) {
         return () => { alive = false; };
     }, []);
 
+    const sentRef = useRef<SaveState | null>(null);
+
     function persistState(s: SaveState) {
+        if (s === sentRef.current) return;
         if (isFiveM) {
-            if (loadedRef.current) void fetchNui('sd-phone:cookie:save', s);
+            if (!loadedRef.current) return;
+            void fetchNui('sd-phone:cookie:save', s);
         } else {
             saveGame(s);
         }
+        sentRef.current = s;
     }
 
     useEffect(() => {
-        const id = setInterval(() => persistState(saveRef.current), 2000);
+        const id = setInterval(() => persistState(saveRef.current), 10000);
         return () => { clearInterval(id); persistState(saveRef.current); };
          
     }, []);

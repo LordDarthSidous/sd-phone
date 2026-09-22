@@ -176,6 +176,31 @@ function job.getDuty(source)
     return nil
 end
 
+---The player's job name, grade and duty from ONE framework lookup. Equivalent to calling getName,
+---getGrade and getDuty in turn, for loops over many players where each lookup copies the whole
+---player object across the resource boundary. Nil when the player can't be resolved.
+---@param source number player server id
+---@return { name: string|nil, grade: integer, duty: boolean|nil }|nil
+function job.getState(source)
+    if framework.qb then
+        local p = player_mod.get(source)
+        if not p then return nil end
+        local data = p.PlayerData.job
+        return {
+            name  = data and data.name or nil,
+            grade = data and data.grade and data.grade.level or 0,
+            duty  = data ~= nil and data.onduty == true,
+        }
+    end
+    if framework.name == 'esx' then
+        local p = player_mod.get(source)
+        if not p then return nil end
+        return { name = p.job and p.job.name or nil, grade = p.job and p.job.grade or 0, duty = nil }
+    end
+    if not player_mod.get(source) then return nil end
+    return { name = job.getName(source), grade = job.getGrade(source), duty = job.getDuty(source) }
+end
+
 ---True when the framework supports a multi-job ("saved jobs") model. QBCore/QBox keep saved jobs
 ---alongside an active one; ox_core and ND are natively multi-group, so a character simply holds
 ---several. False on ESX, which has no such model.

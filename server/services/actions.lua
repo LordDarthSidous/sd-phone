@@ -193,8 +193,9 @@ local function buildMyCompany(src)
             local r    = byCid[ecid]
             local esrc = online[ecid]
             local status, grade
-            if esrc and job.getName(esrc) == myJob then
-                local d = job.getDuty(esrc)
+            local st   = esrc and job.getState(esrc)
+            if st and st.name == myJob then
+                local d = st.duty
                 status = (d == nil or d) and 'duty' or 'offduty'
                 grade  = r.fwGrade or r.savedGrade or 0
             else
@@ -235,17 +236,25 @@ local rosterAt = {}
 ---@type table<string, boolean> Jobs with a trailing roster push already scheduled.
 local rosterQueued = {}
 
+---@type integer How long the on-duty map is reused, in ms. It walks every connected player, so
+---each directory read rebuilding it cost one framework lookup per player.
+local DUTY_TTL = 5000
+---@type { map: table<string, boolean>|nil, at: number } Memo of the last on-duty map.
+local dutyMemo = { map = nil, at = 0 }
+
 ---Every job with at least one player on duty. Built once per directory read: asking per company
----would walk all online players again for each one, and the player object behind it is uncached.
+---would walk all online players again for each one. Reused for DUTY_TTL; a duty flip shows up in
+---the public list within that window.
 ---@return table<string, boolean> jobName -> true
 local function onDutyJobs()
+    local now = GetGameTimer()
+    if dutyMemo.map and now - dutyMemo.at >= 0 and now - dutyMemo.at < DUTY_TTL then return dutyMemo.map end
     local out = {}
     for _, tsrc in pairs(player.onlineCidMap()) do
-        if job.getDuty(tsrc) == true then
-            local name = job.getName(tsrc)
-            if name then out[name] = true end
-        end
+        local st = job.getState(tsrc)
+        if st and st.duty == true and st.name then out[st.name] = true end
     end
+    dutyMemo = { map = out, at = now }
     return out
 end
 
@@ -270,7 +279,8 @@ function actions.notifyRoster(jobName)
 
     local esxBoss = esxBossGrade(jobName)
     for _, tsrc in pairs(player.onlineCidMap()) do
-        if job.getName(tsrc) == jobName and job.isBoss(tsrc, jobName, esxBoss) then
+        local st = job.getState(tsrc)
+        if st and st.name == jobName and job.isBoss(tsrc, jobName, esxBoss) then
             TriggerClientEvent('sd-phone:client:services:rosterChanged', tsrc, {})
         end
     end
@@ -337,6 +347,7 @@ function actions.setDuty(src, payload)
 
     local on = payload.on == true
     job.setDuty(src, on)
+    dutyMemo.map = nil
     store.setDuty(cid, myJob, on)
     TriggerClientEvent('sd-phone:client:services:dutyChanged', src, { job = myJob, duty = on })
     TriggerEvent('sd-phone:services:dutyChanged', src, myJob, on)
